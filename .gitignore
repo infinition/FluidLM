@@ -6,7 +6,6 @@
 
 # Données (Livres, textes, etc.)
 /data/
-*.txt
 !requirements.txt
 GUIDE_VALIDATION.md
 eval_adaptive.py
