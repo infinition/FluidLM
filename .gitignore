@@ -28,25 +28,3 @@ __pycache__/
 # Fichiers OS
 .DS_Store
 Thumbs.db
-
-
-
-feat: initial proof of concept - FluidLM 
-
-Transformer-free language model replacing O(N²) self-attention
-with reaction-diffusion PDEs. Linear complexity, no KV-cache.
-
-Core components:
-- FluidLayer: multi-scale dilated diffusion (d=1,4,16) + reaction MLP + memory pump
-- FluidNet: 4-layer stack with weight-tied head (~36M params)
-- Adaptive compute: Turing equilibrium early stopping (eval mode)
-- Real-time Streamlit dashboard with live hyperparameter control
-- Adaptive compute validation experiment (eval_adaptive.py)
-
-Fixes in the current version:
-- Relative turbulence metric (scale-invariant convergence detection)
-- Corrected diffusion regularization (penalizes anti-diffusion coefficients)
-- Differential LR per dilation group (prevents long-range coeff collapse)
-
-Status: proof of concept - trains and converges, linear scaling verified,
-adaptive mechanism implemented but not yet statistically validated.
