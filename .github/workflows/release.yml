@@ -1,0 +1,156 @@
+name: FluidLM Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog from commits
+        id: changelog
+        run: |
+          # Get commits since last tag (or all commits if first release)
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"- %s (%h)" ${PREV_TAG}..HEAD)
+          fi
+          echo "COMMITS<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Get commit stats
+        id: stats
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            TOTAL=$(git rev-list --count HEAD)
+            FILES=$(git diff --name-only $(git rev-list --max-parents=0 HEAD) HEAD | wc -l)
+            ADDED=$(git log --numstat --pretty="" | awk '{add+=$1} END {print add}')
+            DELETED=$(git log --numstat --pretty="" | awk '{del+=$2} END {print del}')
+          else
+            TOTAL=$(git rev-list --count ${PREV_TAG}..HEAD)
+            FILES=$(git diff --name-only ${PREV_TAG}..HEAD | wc -l)
+            ADDED=$(git diff --numstat ${PREV_TAG}..HEAD | awk '{add+=$1} END {print add}')
+            DELETED=$(git diff --numstat ${PREV_TAG}..HEAD | awk '{del+=$2} END {print del}')
+          fi
+          echo "TOTAL_COMMITS=$TOTAL" >> $GITHUB_OUTPUT
+          echo "FILES_CHANGED=$FILES" >> $GITHUB_OUTPUT
+          echo "LINES_ADDED=$ADDED" >> $GITHUB_OUTPUT
+          echo "LINES_DELETED=$DELETED" >> $GITHUB_OUTPUT
+
+      - name: Create release archive
+        run: |
+          zip -r fluidlm-${{ steps.version.outputs.VERSION }}.zip . \
+            --exclude ".git/*" \
+            --exclude "__pycache__/*" \
+            --exclude "*.pyc" \
+            --exclude ".env" \
+            --exclude "training/*.pth" \
+            --exclude "data/*.txt" \
+            --exclude "results/*" \
+            --exclude "*.tmp"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: "FluidLM ${{ steps.version.outputs.VERSION }}"
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, 'alpha') || contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'rc') }}
+          files: |
+            fluidlm-${{ steps.version.outputs.VERSION }}.zip
+          body: |
+            # FluidLM ${{ steps.version.outputs.VERSION }}
+
+            > A Transformer-free language model replacing O(N²) self-attention with reaction-diffusion PDEs - achieving O(N) scaling, adaptive computation, and no KV-cache.
+
+            **Repository:** https://github.com/infinition/FluidLM
+
+            ---
+
+            ## 📦 Release Summary
+
+            | Metric | Value |
+            |--------|-------|
+            | Commits in this release | ${{ steps.stats.outputs.TOTAL_COMMITS }} |
+            | Files changed | ${{ steps.stats.outputs.FILES_CHANGED }} |
+            | Lines added | +${{ steps.stats.outputs.LINES_ADDED }} |
+            | Lines removed | -${{ steps.stats.outputs.LINES_DELETED }} |
+
+            ---
+
+            ## 📝 Changelog
+
+            ${{ steps.changelog.outputs.COMMITS }}
+
+            ---
+
+            ## 🏗️ Architecture - Quick Reference
+
+            | Property | Value |
+            |----------|-------|
+            | Core mechanism | Reaction-Diffusion PDE (forward Euler) |
+            | Complexity | O(N) - linear in sequence length |
+            | KV-cache | None required |
+            | Dilations | [1, 4, 16] - local / phrase / sentence scale |
+            | Default params | ~36M (d_model=512, 4 layers) |
+            | Adaptive compute | Turing Equilibrium early stopping |
+            | Tokenizer | GPT-2 BPE via tiktoken (50,257 vocab) |
+
+            ---
+
+            ## 🚀 Getting Started
+
+            ```bash
+            git clone https://github.com/infinition/FluidLM.git
+            cd FluidLM
+            pip install -r requirements.txt
+            python launch_lab.py
+            # → http://localhost:8501
+            ```
+
+            Drop `.txt` files into `/data/` and training starts automatically.
+
+            ---
+
+            ## ⚠️ Research Status
+
+            This is a **proof of concept**. It demonstrates that the mathematical
+            framework is sound and the core mechanisms work. It does not compete
+            with production language models on benchmarks.
+
+            What has been verified:
+            - ✅ Architecture trains and converges
+            - ✅ Linear memory scaling with sequence length
+            - ✅ Adaptive compute mechanism fires correctly in inference mode
+            - ⏳ Statistical validation of difficulty-correlated step counts (pending)
+            - ⏳ Perplexity benchmark vs. equivalent Transformer (pending)
+
+            ---
+
+            ## 📄 License
+
+            See [LICENSE](LICENSE) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
