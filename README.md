@@ -1,5 +1,9 @@
 # FluidLM
 
+<img width="1950" height="674" alt="fluidlm_banner" src="https://github.com/user-attachments/assets/d17ee5df-5c7d-423c-a276-1ff4528b9614" />
+
+
+
 **A Transformer-free language model replacing O(N²) self-attention with reaction-diffusion PDEs - achieving O(N) scaling, adaptive computation, and no KV-cache.**
 
 > ⚠️ This is an early-stage proof of concept. It does not compete with production language models. The goal is to demonstrate that the mathematical framework is sound and the core mechanisms work.
