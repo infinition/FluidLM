@@ -20,7 +20,7 @@ The key shift: instead of every token explicitly "looking at" every other token 
 2. [The FluidLM Approach](#2-the-fluidlm-approach)
 3. [For the Non-Specialist](#3-for-the-non-specialist)
 4. [Mathematical Foundations](#4-mathematical-foundations)
-5. [Implemented Features ](#5-implemented-features-v42)
+5. [Implemented Features](#5-implemented-features)
 6. [Architecture Comparison](#6-architecture-comparison)
 7. [Implementation Details](#7-implementation-details)
 8. [Research Dashboard](#8-research-dashboard)
@@ -86,27 +86,21 @@ FluidLM works more like how information spreads in a room. When someone speaks, 
 
 ### 4.1 The Standard Transformer Attention (what we replace)
 
-```
-Attention(Q, K, V) = Softmax(Q · Kᵀ / √d_k) · V
-```
+$$\text{Attention}(Q, K, V) = \text{Softmax}\!\left(\frac{Q \cdot K^\top}{\sqrt{d_k}}\right) \cdot V$$
 
-The product Q·Kᵀ produces the N×N attention matrix. This is the source of O(N²) complexity.
+The product $Q \cdot K^\top$ produces the $N \times N$ attention matrix. This is the source of $O(N^2)$ complexity.
 
 ### 4.2 The FluidLM Governing Equation
 
-FluidLM replaces the attention matrix with a PDE governing a continuous latent state **u** over a virtual time dimension t:
+FluidLM replaces the attention matrix with a PDE governing a continuous latent state $\mathbf{u}$ over a virtual time dimension $t$:
 
-```
-du/dt = Σ_k [ D_k · Laplacian_{d_k}(u) ] + R(u, θ) + α · h_t
-```
+$$\frac{\partial u}{\partial t} = \sum_{k} D_k \cdot \nabla^2_{d_k}(u) + R(u,\, \theta) + \alpha \cdot h_t$$
 
 This equation has three distinct terms:
 
 #### Term 1: Multi-Scale Diffusion
 
-```
-Σ_k [ D_k · Laplacian_{d_k}(u) ]
-```
+$$\sum_{k} D_k \cdot \nabla^2_{d_k}(u)$$
 
 The Laplacian operator measures how different a token's representation is from its neighbors. Where there are sharp differences, diffusion acts to smooth them - propagating information from one token to its neighbors. Three Laplacian operators are applied simultaneously at different scales via **dilated convolutions**:
 
@@ -116,31 +110,25 @@ The Laplacian operator measures how different a token's representation is from i
 | 4 | ~4 tokens | Phrase-level structure |
 | 16 | ~16 tokens | Sentence / paragraph dependencies |
 
-Each scale has a learnable diffusion coefficient D_k. Over 12 time steps × 4 layers, the coarsest scale (dilation 16) can propagate information across approximately 768 token positions.
+Each scale has a learnable diffusion coefficient $D_k$. Over 12 time steps × 4 layers, the coarsest scale (dilation 16) can propagate information across approximately 768 token positions.
 
-The discrete Laplacian is a standard 1D convolution with kernel [1, -2, 1]:
+The discrete Laplacian is a standard 1D convolution with kernel $[1,\ -2,\ 1]$:
 
-```
-Laplacian(u_i) = u_{i-d} - 2·u_i + u_{i+d}
-```
+$$\nabla^2(u_i) = u_{i-d} - 2 \cdot u_i + u_{i+d}$$
 
 This operation is **O(N)** - it touches each token exactly once per dilation, with no pairwise interactions.
 
-**Causal constraint:** All convolutions use left-only zero-padding, ensuring token i can only receive information from positions ≤ i (no future leakage).
+**Causal constraint:** All convolutions use left-only zero-padding, ensuring token $i$ can only receive information from positions $\leq i$ (no future leakage).
 
 #### Term 2: Reaction Function
 
-```
-R(u, θ) = MLP(u) = W₂ · GELU(W₁ · u + b₁) + b₂
-```
+$$R(u,\, \theta) = \text{MLP}(u) = W_2 \cdot \text{GELU}(W_1 \cdot u + b_1) + b_2$$
 
-A per-token 2-layer MLP with hidden dimension 2×d_model. This is the "chemistry" - the local nonlinear transformation that creates new feature combinations. Without reaction, pure diffusion would simply blur all representations toward a uniform average.
+A per-token 2-layer MLP with hidden dimension $2 \times d_\text{model}$. This is the "chemistry" - the local nonlinear transformation that creates new feature combinations. Without reaction, pure diffusion would simply blur all representations toward a uniform average.
 
 #### Term 3: Intra-Sequence Memory Pump (h-state)
 
-```
-h_t = h_{t-1} + sigmoid(W_gate · u_{t-1}) · tanh(R(u_{t-1}, θ))
-```
+$$h_t = h_{t-1} + \sigma(W_\text{gate} \cdot u_{t-1}) \cdot \tanh\!\left(R(u_{t-1},\, \theta)\right)$$
 
 A gated accumulation mechanism that maintains a running reservoir of semantic reactions throughout the integration process. It provides gradient stabilization (analogous to residual connections) and temporal persistence across integration steps.
 
@@ -150,9 +138,7 @@ A gated accumulation mechanism that maintains a running reservoir of semantic re
 
 The PDE is discretized using forward Euler:
 
-```
-u_{t+1} = LayerNorm( u_t + dt · [ Σ_k D_k · Laplacian_{d_k}(u_t) + R(u_t, θ) + α · h_t ] )
-```
+$$u_{t+1} = \text{LayerNorm}\!\left( u_t + \Delta t \cdot \left[ \sum_k D_k \cdot \nabla^2_{d_k}(u_t) + R(u_t,\, \theta) + \alpha \cdot h_t \right] \right)$$
 
 LayerNorm is applied after each step to prevent state divergence - a necessity given that forward Euler is only conditionally stable.
 
@@ -160,9 +146,7 @@ LayerNorm is applied after each step to prevent state divergence - a necessity g
 
 Instead of running a fixed number of integration steps, FluidLM monitors the convergence of the latent fluid and halts early when the system stabilizes. The convergence criterion is:
 
-```
-turbulence = mean( ‖Δu_i‖ / (‖u_i‖ + ε) )   over all tokens i
-```
+$$\text{turbulence} = \operatorname{mean}_i\!\left(\frac{\|\Delta u_i\|}{\|u_i\| + \varepsilon}\right) \quad \xrightarrow{\quad \text{if} < \varepsilon \quad} \quad \text{HALT}$$
 
 If `turbulence < epsilon`, the system has reached **Turing Equilibrium** - a stable pattern that will not change significantly with further computation.
 
@@ -173,7 +157,7 @@ This adaptive behavior emerges directly from the physics of the system - the mod
 
 ---
 
-## 5. Implemented Features 
+## 5. Implemented Features
 
 | Feature | Status | Description |
 |---------|--------|-------------|
@@ -197,13 +181,13 @@ This adaptive behavior emerges directly from the physics of the system - the mod
 
 ### Structural Comparison
 
-| Property | Transformer (GPT-class) | FluidLM  |
-|----------|-------------------------|----------------|
-| **Core mechanism** | Self-Attention (Q·Kᵀ·V) | Reaction-Diffusion PDE |
-| **Complexity per layer** | O(N² · d) | O(N · d · K) where K = dilations |
+| Property | Transformer (GPT-class) | FluidLM |
+|----------|-------------------------|---------|
+| **Core mechanism** | Self-Attention ($Q \cdot K^\top \cdot V$) | Reaction-Diffusion PDE |
+| **Complexity per layer** | $O(N^2 \cdot d)$ | $O(N \cdot d \cdot K)$ where $K$ = dilations |
 | **Receptive field** | Global (all tokens) | Multi-scale local (~768 tokens at max dilation) |
-| **Computation per input** | Fixed (L layers, always) | Adaptive (T_min to T_max steps) |
-| **Inference memory** | O(L · N · d) for KV-cache | O(N · d) - **no cache required** |
+| **Computation per input** | Fixed (L layers, always) | Adaptive ($T_\text{min}$ to $T_\text{max}$ steps) |
+| **Inference memory** | $O(L \cdot N \cdot d)$ for KV-cache | $O(N \cdot d)$ — **no cache required** |
 
 ### Concrete FLOP Comparison (N = 8,192 tokens, d_model = 512)
 
@@ -293,7 +277,7 @@ This is deliberately small - the goal is to validate the mechanism, not to chase
 
 ## 8. Research Dashboard
 
-The Streamlit-based dashboard  provides real-time visibility into the training process and is designed as a research instrument, not just a monitoring tool.
+The Streamlit-based dashboard provides real-time visibility into the training process and is designed as a research instrument, not just a monitoring tool.
 
 **Live Metrics:** loss with delta tracking, average integration steps (the key adaptive compute metric), VRAM consumption, training speed, ETA.
 
@@ -326,7 +310,7 @@ The Streamlit-based dashboard  provides real-time visibility into the training p
 
 ### Known Limitations
 
-- The forward Euler integrator is first-order and conditionally stable. Large dt values can cause divergence.
+- The forward Euler integrator is first-order and conditionally stable. Large $\Delta t$ values can cause divergence.
 - The h-state resets every forward pass - no inter-sequence memory.
 - Learned absolute positional encoding limits generalization to unseen sequence lengths.
 - Generation quality at this scale (36M parameters, limited data) is not representative of the architecture's ceiling.
@@ -343,14 +327,14 @@ The Streamlit-based dashboard  provides real-time visibility into the training p
 
 ### Medium-term
 
-4. **Inter-Sequence Persistent Memory** - Pass the latent state u and the reservoir h between sequential batches as detached external states, similar to Transformer-XL. This would give FluidLM true unbounded temporal memory.
+4. **Inter-Sequence Persistent Memory** - Pass the latent state $u$ and the reservoir $h$ between sequential batches as detached external states, similar to Transformer-XL. This would give FluidLM true unbounded temporal memory.
 5. **Higher-Order Integration** - Replace forward Euler with RK4 or implicit integrators for improved stability.
 6. **Neural ODE Adjoint Methods** - Backpropagate through integration without storing intermediate states, dramatically reducing training VRAM.
 
 ### Long-term
 
 7. **Holographic Degradation Testing** - Systematically prune portions of the latent space and measure performance degradation curves. The hypothesis: distributed, fluid representations degrade more gracefully than the discrete representations in Transformers.
-8. **Sparse Spatial Activation** - Compute updates only where the semantic "wavefront" is active (Δu > τ), potentially reducing inference energy by orders of magnitude.
+8. **Sparse Spatial Activation** - Compute updates only where the semantic "wavefront" is active ($\Delta u > \tau$), potentially reducing inference energy by orders of magnitude.
 9. **RoPE Integration** - Replace absolute positional encoding with Rotary Positional Embeddings for better length generalization.
 
 ---
@@ -402,4 +386,4 @@ This PoC proves that we can train a language model with no quadratic bottleneck,
 
 ---
 
-*Proof of Concept  - Research prototype by Fabien POLLY (Infinition), not a production system.*
+*Proof of Concept - Research prototype by Fabien POLLY (Infinition), not a production system.*
