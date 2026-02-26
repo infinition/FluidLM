@@ -358,7 +358,19 @@ The Streamlit-based dashboard provides real-time visibility into the training pr
 git clone https://github.com/infinition/FluidLM.git
 cd FluidLM
 pip install -r requirements.txt
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
 ```
+
+Or conda : 
+
+```bash
+conda create -n fluidlm python=3.12 -y
+conda activate fluidlm
+conda install -y pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+python -m pip install -r requirements.txt
+```
+
 
 ### Running the Lab
 
