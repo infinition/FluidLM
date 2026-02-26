@@ -150,7 +150,7 @@ LayerNorm is applied after each step to prevent state divergence - a necessity g
 
 Instead of running a fixed number of integration steps, FluidLM monitors the convergence of the latent fluid and halts early when the system stabilizes. The convergence criterion is:
 
-$$\text{turbulence} = \operatorname{mean}_i\!\left(\frac{\|\Delta u_i\|}{\|u_i\| + \varepsilon}\right) \quad \xrightarrow{\quad \text{if} < \varepsilon \quad} \quad \text{HALT}$$
+$$\text{turbulence}=\mathrm{mean}_i\!\left(\frac{|\Delta u_i|}{|u_i|+\varepsilon}\right)\quad\xrightarrow{\ \text{if }<\varepsilon\ }\quad\text{HALT}$$
 
 If `turbulence < epsilon`, the system has reached **Turing Equilibrium** - a stable pattern that will not change significantly with further computation.
 
