@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 # =============================================================================
-# FluidLM Training Engine — V4.2.2
+# FluidLM Training Engine -- V4.5.0
 # =============================================================================
 #
-# Core training loop for the FluidLM (Fluid Language Model) architecture.
-#
-# This file contains:
-#   1. BPETokenizer     — GPT-2 BPE tokenizer wrapper (via tiktoken)
-#   2. TextDataset      — Sliding-window dataset with configurable stride
-#   3. FluidLayer       — The fundamental reaction-diffusion PDE layer
-#   4. FluidNet         — Full model: embedding → N×FluidLayer → tied head
-#   5. generate_text()  — Autoregressive sampling with repetition penalty
-#   6. train()          — Main training loop with live config hot-reloading
-#
-# Key design decisions documented inline. The architecture replaces the
-# Transformer's O(N²) self-attention with O(N) multi-scale dilated diffusion
-# governed by a discretized PDE (forward Euler). See README.md §4 for the
-# full mathematical treatment.
+# V4.5.0 (architecture upgrade):
+#   [ARCH-10] SwiGLU replaces GELU MLP (LLaMA/PaLM proven activation)
+#   [ARCH-11] Multi-Head CausalLongConv (K=33/65/129/257 per head)
+#   [ARCH-12] RMSNorm replaces LayerNorm (more stable, fewer params)
+#   [ARCH-13] Cross-channel mixing after depthwise conv
+#   [ARCH-14] Persistent h-state across segments (optional)
+#   [ARCH-15] Residual scaling 1/sqrt(num_layers) on PDE update
+#   [TRAIN-8] seq_len 256, grad_accum 4 (effective batch 128)
 #
 # Author: Fabien POLLY aka Infinition
 # =============================================================================
@@ -29,24 +23,25 @@ import os
 import glob
 import json
 import time
+import math
 import numpy as np
 from tqdm import tqdm
 import tiktoken
+from collections import deque
 
-# ── Device selection ─────────────────────────────────────────────────────────
-# We default to CUDA if available. MPS (Apple Silicon) support could be added
-# here but is untested with the dilated conv1d operations.
+try:
+    from src.core import FluidNet
+except ImportError:
+    from src.core import FluidNet
+
+# -- Device selection ---------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── File paths ───────────────────────────────────────────────────────────────
-# These three JSON files form the IPC layer between the training engine and
-# the Streamlit dashboard:
-#   - CONFIG_FILE: bidirectional — dashboard writes params, engine reads them
-#   - LOG_FILE:    engine → dashboard — per-step telemetry snapshot
-#   - STATS_FILE:  engine → dashboard — rolling history (last 1000 points)
+# -- File paths ---------------------------------------------------------------
 CONFIG_FILE = "config.json"
 LOG_FILE = "live_logs.json"
 STATS_FILE = "training_stats.json"
+SAMPLE_HISTORY_FILE = "sample_history.jsonl"
 
 SAVE_PATH = "./training"
 MODEL_FILE = os.path.join(SAVE_PATH, "fluidlm_model.pth")
@@ -57,17 +52,6 @@ MODEL_FILE = os.path.join(SAVE_PATH, "fluidlm_model.pth")
 # =============================================================================
 
 def atomic_write(data, path, retries=3):
-    """
-    Atomic JSON write using tmp file + os.replace().
-
-    Critical for concurrent access: the training loop and Streamlit dashboard
-    both read/write config.json. Without atomic writes, a partial write could
-    corrupt the JSON and crash the reader. os.replace() is atomic on POSIX
-    systems and nearly atomic on Windows (NTFS).
-
-    Retry logic handles rare filesystem lock contention (observed on Windows
-    with antivirus software holding brief locks on newly created files).
-    """
     for attempt in range(retries):
         tmp_path = path + ".tmp"
         try:
@@ -77,42 +61,43 @@ def atomic_write(data, path, retries=3):
             return True
         except Exception as e:
             if attempt == retries - 1:
-                print(f"⚠️ Failed to write {path} after {retries} attempts: {e}")
+                print(f"WARNING: Failed to write {path} after {retries} attempts: {e}")
             time.sleep(0.1 * (attempt + 1))
     return False
 
 
-def load_config():
-    """
-    Load the shared configuration file, falling back to sensible defaults
-    if the file doesn't exist or is corrupted.
+def append_jsonl(data, path):
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        print(f"WARNING: Failed to append {path}: {e}")
+        return False
 
-    Default hyperparameters rationale:
-      - lr=1e-4: standard AdamW starting point for small models
-      - batch_size=32, seq_len=128: conservative for 8-12GB VRAM
-      - d_model=512: ~36M params — fast iteration for architecture research
-      - t_steps=12: max integration steps per layer (adaptive may use fewer)
-      - dt=0.1: Euler step size — larger = faster integration but less stable
-      - epsilon=1e-4: convergence threshold for Turing equilibrium detection
-      - grad_accum_steps=2: effective batch size = 32×2 = 64
-      - warmup_steps=500: linear LR warmup to avoid early training instability
-    """
+
+def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     except Exception:
         return {
-            "lr": 1e-4,
+            "lr": 3e-4,
             "batch_size": 32,
-            "seq_len": 128,
+            "seq_len": 256,
             "d_model": 512,
-            "t_steps": 12,
+            "t_steps": 8,
             "dt": 0.1,
             "repetition_penalty": 1.5,
             "temperature": 0.8,
-            "grad_accum_steps": 2,
+            "grad_accum_steps": 4,
             "warmup_steps": 500,
             "epsilon": 0.05,
+            "eq_weight": 0.01,
+            "gate_reg_weight": 0.08,
+            "total_steps": 50000,
+            "grad_loss_weight": 0.005,
+            "curriculum_steps": 5000,
         }
 
 
@@ -121,31 +106,16 @@ def load_config():
 # =============================================================================
 
 class BPETokenizer:
-    """
-    Thin wrapper around tiktoken's GPT-2 BPE encoding.
-
-    We use GPT-2's tokenizer (50,257 vocab) rather than training our own
-    because: (a) the architecture research is about the model, not the
-    tokenizer, and (b) BPE gives us a realistic vocabulary size that tests
-    the embedding/head weight-tying at production scale.
-
-    For a proper scaling study, you'd want to train a SentencePiece or
-    BPE tokenizer on your specific corpus. For PoC purposes, GPT-2's
-    tokenizer is a well-understood baseline.
-    """
-
     def __init__(self):
         self.enc = tiktoken.get_encoding("gpt2")
         self.vocab_size = self.enc.n_vocab
 
     def encode(self, text):
-        """Encode text → tensor of token IDs."""
         return torch.tensor(
             self.enc.encode(text, allowed_special="all"), dtype=torch.long
         )
 
     def decode(self, tokens):
-        """Decode token IDs → text. Silently handles invalid sequences."""
         if isinstance(tokens, torch.Tensor):
             tokens = tokens.tolist()
         try:
@@ -159,44 +129,26 @@ class BPETokenizer:
 # =============================================================================
 
 class TextDataset(Dataset):
-    """
-    Sliding-window text dataset with configurable stride.
-
-    Design choices:
-      - stride = seq_len // 2: 50% overlap between consecutive windows.
-        This doubles the effective dataset size compared to non-overlapping
-        windows, at zero additional memory cost (we index into a single
-        contiguous token tensor). The overlap also means that most tokens
-        appear in two different context positions, which acts as a mild
-        form of data augmentation.
-
-      - We load ALL .txt files from the data directory and concatenate them
-        into a single stream. For a more principled approach, you'd want
-        document boundaries and proper shuffling at the document level
-        (as in GPT-2/3 training), but for a PoC this is sufficient.
-
-      - Labels are simply the input shifted by one position (standard
-        causal language modeling objective).
-    """
-
     def __init__(self, path, seq_len, tokenizer):
         self.seq_len = seq_len
         self.tokenizer = tokenizer
-        self.stride = seq_len // 2  # 50% overlap between windows
+        self.stride = seq_len // 2
 
-        # ── Load and concatenate all .txt files ──────────────────────────
         files = glob.glob(os.path.join(path, "*.txt"))
+        if not files:
+            raise ValueError(
+                f"ERROR: No .txt files found in {path}/\n"
+                f"   Please add text files to the /data/ directory."
+            )
+
         raw = ""
         for f in files:
             with open(f, "r", encoding="utf-8") as fl:
                 raw += fl.read() + "\n"
 
-        if not raw:
-            raise ValueError("❌ No .txt files found in /data/")
-
-        print("🧠 Tokenizing dataset (BPE)...")
+        print("Tokenizing dataset (BPE)...")
         self.data = self.tokenizer.encode(raw)
-        print(f"✅ Dataset loaded: {len(self.data):,} tokens.")
+        print(f"Dataset loaded: {len(self.data):,} tokens.")
 
     def __len__(self):
         return max(0, (len(self.data) - self.seq_len - 1) // self.stride)
@@ -207,359 +159,11 @@ class TextDataset(Dataset):
 
 
 # =============================================================================
-# FluidLayer — The Core PDE Unit
-# =============================================================================
-
-class FluidLayer(nn.Module):
-    """
-    A single Reaction-Diffusion layer implementing the FluidLM governing equation:
-
-        du/dt = Σ_k [ D_k · Laplacian_{d_k}(u) ] + R(u, θ) + α · h_t
-
-    where:
-      - The first term is multi-scale diffusion (local information propagation)
-      - R(u, θ) is the reaction function (nonlinear per-token MLP)
-      - h_t is the intra-sequence memory pump (gated accumulation)
-
-    This replaces the Transformer's self-attention + FFN block.
-
-    Complexity: O(N × d_model × K) per time step, where K=3 (number of
-    dilation scales). Compare to O(N² × d_model) for self-attention.
-
-    The layer integrates the PDE for up to `max_steps` Euler steps, but can
-    halt early when the system reaches Turing equilibrium (turbulence < ε).
-    During training, it always runs all steps (for consistent gradients) but
-    records when equilibrium would have been reached. During inference
-    (model.eval()), it genuinely halts early, saving compute.
-    """
-
-    def __init__(self, d_model):
-        super().__init__()
-        self.d_model = d_model
-
-        # ── Reaction function ────────────────────────────────────────────
-        # 2-layer MLP with GELU activation and hidden dim = 2×d_model.
-        # This is the "chemistry" — local nonlinear transformation that
-        # creates new feature combinations. Without it, pure diffusion
-        # would blur everything to a uniform average.
-        self.reaction = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
-        )
-
-        # ── Memory gate ──────────────────────────────────────────────────
-        # Sigmoid gate controlling how much reaction output enters the
-        # accumulation reservoir (h-state). This lets the model learn
-        # *which* reactions are worth remembering across integration steps.
-        self.memory_gate = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.Sigmoid(),
-        )
-
-        # ── Discrete Laplacian kernel ────────────────────────────────────
-        # The 1D discrete Laplacian: [1, -2, 1]
-        # Applied as a depthwise conv1d (groups=d_model), computing:
-        #   Lap(u_i) = u_{i-d} - 2·u_i + u_{i+d}
-        # for each dilation d. This measures how different a token's
-        # representation is from its neighbors — where the gradient is
-        # steep, diffusion is strong.
-        self.register_buffer(
-            "diffusion_kernel", torch.tensor([1.0, -2.0, 1.0]).view(1, 1, 3)
-        )
-
-        # ── Multi-scale dilation configuration ───────────────────────────
-        # Three scales capture different linguistic granularities:
-        #   d=1  → adjacent tokens (morphology, local syntax)
-        #   d=4  → phrase-level (4-token span ≈ 1-2 words in BPE)
-        #   d=16 → sentence/paragraph level dependencies
-        # Over T=12 steps × 4 layers, the coarsest scale reaches ~768 positions.
-        self.dilations = [1, 4, 16]
-
-        # Learnable diffusion coefficients D_k — one per scale, per feature dim.
-        #
-        # [FIX v4.2.1] Staggered initialization by dilation:
-        #   - dilation=1  → 0.15 (slightly above the original 0.1 init)
-        #   - dilation=4  → 0.10 (forced to exist from the start)
-        #   - dilation=16 → 0.08 (forced to exist from the start)
-        # Without this, the gradient kills long-range dilations because
-        # local dependencies (dilation=1) are sufficient to reduce next-token
-        # loss on short sequences (seq_len=128).
-        # The differential LR in the optimizer complements this initialization
-        # by compensating for the naturally weak gradient on long-range D_k.
-        self.diff_coeffs = nn.ParameterList([
-            nn.Parameter(torch.ones(1, 1, d_model) * 0.15),  # dilation=1
-            nn.Parameter(torch.ones(1, 1, d_model) * 0.10),  # dilation=4
-            nn.Parameter(torch.ones(1, 1, d_model) * 0.08),  # dilation=16
-        ])
-
-        # ── Post-step normalization ──────────────────────────────────────
-        # LayerNorm after each Euler step prevents state divergence.
-        # Forward Euler is only conditionally stable; without normalization,
-        # large dt or aggressive diffusion coefficients can cause the state
-        # to explode. LayerNorm acts as a soft constraint keeping the state
-        # on a bounded manifold.
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x, max_steps, dt, return_history=False, epsilon=1e-4):
-        """
-        Integrate the reaction-diffusion PDE for up to max_steps Euler steps.
-
-        Args:
-            x:              Input tensor [batch, seq_len, d_model]
-            max_steps:      Maximum number of integration steps (T_max)
-            dt:             Euler step size (Δt)
-            return_history: If True, record activation heatmaps per step
-            epsilon:        Convergence threshold for Turing equilibrium
-
-        Returns:
-            x:              Final latent state [batch, seq_len, d_model]
-            hist:           (optional) List of activation snapshots
-            steps_needed:   Number of steps before equilibrium was reached
-        """
-        # ── Initialize accumulators ──────────────────────────────────────
-        # local_acc: the "memory pump" (h-state) — accumulates gated
-        #   reaction outputs across time steps. Reset every forward pass
-        #   (this is intra-sequence memory, not inter-sequence).
-        local_acc = torch.zeros_like(x)
-        hist = []
-        steps_needed = max_steps
-        equilibrium_reached = False
-
-        # Detached copy for turbulence computation.
-        # We detach to avoid including the convergence check in the
-        # computational graph (it's a diagnostic, not a learned operation).
-        x_prev = x.detach().clone()
-
-        for step_idx in range(max_steps):
-            # ── Multi-scale diffusion ────────────────────────────────────
-            # Transpose to [batch, d_model, seq_len] for conv1d.
-            out = x.transpose(1, 2)
-
-            total_diffusion = torch.zeros_like(x)
-            for i, d in enumerate(self.dilations):
-                # Causal padding: pad_len = 2×dilation on the LEFT only.
-                # This ensures token at position i can only receive info
-                # from positions ≤ i (no future leakage during training).
-                # For kernel size 3 with dilation d, we need padding = 2d
-                # to maintain the output sequence length.
-                pad_len = 2 * d
-                padded_out = F.pad(out, (pad_len, 0), mode="constant", value=0.0)
-
-                # Depthwise conv1d: each feature dimension is convolved
-                # independently (groups=d_model), applying the Laplacian
-                # kernel at the current dilation. This is O(N×d) per scale.
-                lap = F.conv1d(
-                    padded_out,
-                    self.diffusion_kernel.expand(self.d_model, 1, 3),
-                    dilation=d,
-                    groups=self.d_model,
-                )
-
-                # Accumulate weighted diffusion from this scale.
-                # diff_coeffs[i] has shape [1, 1, d_model] — each feature
-                # dimension has its own learned diffusion rate at this scale.
-                total_diffusion = total_diffusion + lap.transpose(1, 2) * self.diff_coeffs[i]
-
-            # ── Reaction ─────────────────────────────────────────────────
-            # Per-token MLP — the "chemistry" that creates new semantic
-            # compounds. This is analogous to the FFN in a Transformer.
-            react = self.reaction(x)
-
-            # ── Memory pump update ───────────────────────────────────────
-            # h_{t} = h_{t-1} + gate(u) · tanh(R(u))
-            # The sigmoid gate controls what enters the reservoir;
-            # tanh compresses the reaction output to [-1, 1].
-            # α=0.05 keeps the memory influence moderate relative to
-            # the primary diffusion and reaction forces.
-            local_acc = local_acc + self.memory_gate(x) * torch.tanh(react)
-
-            # ── Euler integration step ───────────────────────────────────
-            # u_{t+1} = LayerNorm( u_t + Δt · [diffusion + reaction + α·h] )
-            # This is the complete FluidLM update rule, discretized with
-            # forward Euler and stabilized by LayerNorm.
-            x = self.norm(x + dt * (total_diffusion + react + 0.05 * local_acc))
-
-            # ── Record activation history (for Turing wave visualization) ─
-            if return_history:
-                hist.append(x.abs().mean(dim=-1).detach().cpu().float().numpy())
-
-            # ── Turing equilibrium check ─────────────────────────────────
-            # Every 3 steps (to reduce GPU overhead), we measure the
-            # "turbulence" — how much the state has changed since the
-            # last check. If turbulence < ε, the fluid has stabilized
-            # into a Turing pattern and further integration is redundant.
-            #
-            # CRITICAL: We normalize per-token (dim=-1 gives the L2 norm
-            # across d_model for each token, then .mean() averages across
-            # batch and sequence positions). This makes the metric
-            # INDEPENDENT of sequence length — a 10-token input and a
-            # 100-token input are compared on the same scale.
-            #
-            # The old formula (torch.norm(x-x_prev) / x.numel()) divided
-            # by batch×seq_len×d_model, making convergence artificially
-            # easier for longer sequences (larger denominator).
-            #
-            # With this fix, epsilon values are on a different scale:
-            #   Old ε=1e-4  ≈  New ε=0.05 (roughly)
-            #   The new scale is the mean L2 displacement per token.
-            #
-            # During training: we record the step but DON'T break (we need
-            # a consistent computational graph for gradient computation).
-            # During inference (model.eval()): we genuinely halt early.
-            if not equilibrium_reached and (step_idx % 3 == 2 or step_idx == max_steps - 1):
-                with torch.no_grad():
-                    # [FIX v4.2.2] Relative turbulence — divides the absolute delta
-                    # by the current norm of x. Without this, LayerNorm re-inflates
-                    # x at each step (~fixed norm √d_model ≈ 22.6 for d=512),
-                    # making the absolute delta always large regardless of true
-                    # convergence. Relative turbulence measures the RATIO
-                    # change/amplitude, which is scale-invariant and sensitive to
-                    # genuine fluid stabilization.
-                    # Formula: mean(‖Δu_i‖ / (‖u_i‖ + 1e-8)) over all tokens.
-                    delta_norm = (x - x_prev).norm(dim=-1)          # [batch, seq]
-                    state_norm = x.norm(dim=-1).clamp(min=1e-8)      # [batch, seq]
-                    turbulence = (delta_norm / state_norm).mean()
-
-                if turbulence < epsilon:
-                    steps_needed = step_idx + 1
-                    equilibrium_reached = True
-                    if not self.training:
-                        break  # Genuine early exit during inference
-
-                # Update reference point for next turbulence measurement
-                x_prev = x.detach().clone()
-
-        return (x, hist, steps_needed) if return_history else (x, steps_needed)
-
-
-# =============================================================================
-# FluidNet — Full Model
-# =============================================================================
-
-class FluidNet(nn.Module):
-    """
-    The complete FluidLM language model.
-
-    Architecture:
-        Input IDs → Embedding + PosEmb → [FluidLayer × num_layers] → Linear Head → Logits
-
-    Key design choices:
-      - Weight tying: the output head shares weights with the embedding.
-        This is standard practice (Press & Wolf, 2017) and reduces params
-        by ~25M for a 50K vocab with d_model=512.
-
-      - Learned absolute positional embeddings (up to 4096 positions).
-        This is a known limitation — the model cannot generalize to unseen
-        sequence lengths without interpolation. RoPE integration is on the
-        roadmap (see README §10).
-
-      - num_layers=4: each layer runs its own independent PDE integration.
-        The total "depth" is num_layers × avg_steps_per_layer, which is
-        adaptive. With 4 layers × 12 max steps = 48 effective "layers"
-        of computation in the worst case.
-
-      - avg_steps is reported as the mean across all layers, giving a
-        single scalar that tracks the model's computational effort.
-    """
-
-    def __init__(self, v_size, d_model, num_layers=4):
-        super().__init__()
-        self.embedding = nn.Embedding(v_size, d_model)
-
-        # Learned absolute positional encoding — pre-allocated for 4096 positions.
-        # If seq_len > 4096, we fall back to linear interpolation (not ideal,
-        # but sufficient for the PoC). RoPE would be strictly better here.
-        self.pos_emb = nn.Parameter(torch.zeros(1, 4096, d_model))
-
-        self.layers = nn.ModuleList([FluidLayer(d_model) for _ in range(num_layers)])
-
-        # Output head — weight-tied with embedding (reduces param count
-        # significantly and provides a useful inductive bias: tokens with
-        # similar embeddings produce similar output distributions).
-        self.head = nn.Linear(v_size, d_model, bias=False)  # Placeholder dims
-        self.head = nn.Linear(d_model, v_size, bias=False)
-        self.head.weight = self.embedding.weight  # Weight tying
-
-    def forward(self, x, steps, dt, return_history=False, epsilon=1e-4):
-        """
-        Full forward pass: embed → integrate × N layers → project to vocab.
-
-        Args:
-            x:              Input token IDs [batch, seq_len]
-            steps:          Max integration steps per layer
-            dt:             Euler step size
-            return_history: Record wave visualization data (last layer only)
-            epsilon:        Convergence threshold
-
-        Returns:
-            logits:     Output logits [batch, seq_len, vocab_size]
-            hist:       (optional) Activation history from last layer
-            avg_steps:  Mean integration steps across all layers
-        """
-        seq_len = x.size(1)
-
-        # ── Positional encoding with fallback interpolation ──────────────
-        if seq_len > self.pos_emb.size(1):
-            # Linear interpolation for sequences longer than pre-allocated size.
-            # This is a stopgap — it works but degrades quality for very long
-            # sequences. RoPE or ALiBi would handle this more gracefully.
-            pos_emb = F.interpolate(
-                self.pos_emb.transpose(1, 2), size=seq_len, mode="linear"
-            ).transpose(1, 2)
-        else:
-            pos_emb = self.pos_emb[:, :seq_len, :]
-
-        x = self.embedding(x) + pos_emb
-
-        hist = []
-        total_steps = 0
-
-        # ── Layer-by-layer PDE integration ───────────────────────────────
-        for i, layer in enumerate(self.layers):
-            is_last_layer = i == len(self.layers) - 1
-
-            # Only record wave history for the last layer (to keep the
-            # visualization meaningful and avoid excessive memory usage).
-            if return_history and is_last_layer:
-                x, hist, s = layer(x, steps, dt, return_history=True, epsilon=epsilon)
-            else:
-                x, s = layer(x, steps, dt, epsilon=epsilon)
-            total_steps += s
-
-        avg_steps = total_steps / len(self.layers)
-        logits = self.head(x)
-
-        return (logits, hist, avg_steps) if return_history else (logits, avg_steps)
-
-
-# =============================================================================
 # Text Generation
 # =============================================================================
 
 def generate_text(model, tokenizer, config, start_str="The ", max_tokens=60):
-    """
-    Autoregressive text generation with temperature and repetition penalty.
-
-    The generation loop runs the full model in eval mode (which enables
-    genuine early stopping in the PDE integration — see FluidLayer.forward).
-
-    Repetition penalty implementation follows Keskar et al. (2019):
-      - For tokens that have appeared in the recent window:
-        - If logit < 0: multiply by penalty (makes it more negative → less likely)
-        - If logit > 0: divide by penalty (makes it less positive → less likely)
-      - This asymmetric treatment prevents the penalty from accidentally
-        *boosting* tokens that the model actively wants to suppress.
-
-    The history window (default 50 tokens) limits the penalty's reach,
-    preventing it from suppressing common function words that naturally
-    repeat across long outputs.
-
-    Note: this is called inside the training loop every 50 steps for
-    monitoring purposes. At ~30 tokens per sample, this adds ~0.5s of
-    overhead per log step. For faster training, increase the log interval.
-    """
-    model.eval()  # Switches self.training=False → enables early stopping in PDE
+    model.eval()
 
     with torch.no_grad():
         if not start_str:
@@ -569,34 +173,91 @@ def generate_text(model, tokenizer, config, start_str="The ", max_tokens=60):
             enc = torch.tensor([0], dtype=torch.long)
         chars = enc.unsqueeze(0).to(DEVICE)
 
-        history_window = []
-        window_size = 50
+        history_window = deque(maxlen=int(config.get("repeat_window", 80)))
+        top_k = max(0, int(config.get("top_k", 40)))
+        top_p = float(config.get("top_p", 0.92))
+        min_new_tokens = max(1, int(config.get("min_new_tokens", min(24, max_tokens))))
+        no_repeat_ngram_size = max(0, int(config.get("no_repeat_ngram_size", 3)))
+        inference_epsilon = float(config.get("inference_epsilon", min(float(config.get("epsilon", 1e-4)), 0.01)))
+        eot_token_id = getattr(getattr(tokenizer, "enc", None), "eot_token", None)
+
+        def apply_top_k_top_p(logits: torch.Tensor) -> torch.Tensor:
+            filtered = logits
+
+            if top_k > 0 and top_k < filtered.shape[-1]:
+                threshold = torch.topk(filtered, top_k, dim=-1).values[..., -1, None]
+                filtered = filtered.masked_fill(filtered < threshold, float("-inf"))
+
+            if 0.0 < top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+                sorted_remove = cumulative_probs > top_p
+                sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+                sorted_remove[..., 0] = False
+
+                remove_mask = torch.zeros_like(filtered, dtype=torch.bool)
+                remove_mask.scatter_(1, sorted_indices, sorted_remove)
+                filtered = filtered.masked_fill(remove_mask, float("-inf"))
+
+            return filtered
+
+        def banned_ngram_tokens(token_ids):
+            if no_repeat_ngram_size <= 1 or len(token_ids) < no_repeat_ngram_size - 1:
+                return set()
+
+            prefix = tuple(token_ids[-(no_repeat_ngram_size - 1):])
+            banned = set()
+            limit = len(token_ids) - no_repeat_ngram_size + 1
+            for idx in range(max(0, limit)):
+                if tuple(token_ids[idx : idx + no_repeat_ngram_size - 1]) == prefix:
+                    banned.add(token_ids[idx + no_repeat_ngram_size - 1])
+            return banned
 
         for _ in range(max_tokens):
             with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-                logits, _ = model(
+                # Note: dt=None is correct — dt_val is learned via dt_gate,
+                # the config dt only sets the initialization point [FIX-2]
+                out = model(
                     chars[:, -config["seq_len"] :],
                     config["t_steps"],
-                    config["dt"],
-                    epsilon=config.get("epsilon", 1e-4),
+                    None,   # dt is learned, not passed at inference
+                    epsilon=inference_epsilon,
                 )
-                logits = logits[:, -1, :] / config["temperature"]
+                logits = out[0]
+                logits = logits[:, -1, :] / max(float(config["temperature"]), 1e-4)
 
-            # ── Repetition penalty ───────────────────────────────────────
+            logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
+
             for idx in set(history_window):
                 if logits[0, idx] < 0:
                     logits[0, idx] *= config["repetition_penalty"]
                 else:
                     logits[0, idx] /= config["repetition_penalty"]
 
-            next_c = torch.multinomial(F.softmax(logits, dim=-1), 1)
+            for idx in banned_ngram_tokens(chars[0].tolist()):
+                logits[0, idx] = float("-inf")
+
+            generated_tokens = chars.shape[1] - enc.numel()
+            if eot_token_id is not None and generated_tokens < min_new_tokens:
+                logits[0, eot_token_id] = float("-inf")
+
+            logits = apply_top_k_top_p(logits)
+
+            probs = F.softmax(logits, dim=-1)
+            if not torch.isfinite(probs).all() or probs.sum() <= 0:
+                probs = F.softmax(torch.nan_to_num(logits, nan=-1e9, posinf=50.0, neginf=-1e9), dim=-1)
+
+            next_c = torch.multinomial(probs, 1)
             chars = torch.cat([chars, next_c], dim=1)
 
-            history_window.append(next_c.item())
-            if len(history_window) > window_size:
-                history_window.pop(0)
+            token_id = next_c.item()
+            history_window.append(token_id)
+            if eot_token_id is not None and token_id == eot_token_id and generated_tokens >= min_new_tokens:
+                break
 
-    model.train()  # Re-enable training mode for gradient computation
+    model.train()
     return tokenizer.decode(chars[0].tolist())
 
 
@@ -605,17 +266,6 @@ def generate_text(model, tokenizer, config, start_str="The ", max_tokens=60):
 # =============================================================================
 
 def build_loader(cfg, tokenizer):
-    """
-    Construct a DataLoader from the current config.
-
-    Called at startup and whenever batch_size or seq_len changes (detected
-    by the hot-reload mechanism in the training loop). Rebuilding the loader
-    is necessary because changing seq_len requires re-windowing the dataset,
-    and changing batch_size requires a new DataLoader instance.
-
-    num_workers=2 on Linux/Mac for async data loading; 0 on Windows because
-    PyTorch's multiprocessing + Windows = pain.
-    """
     ds = TextDataset("./data", cfg["seq_len"], tokenizer)
     if len(ds) == 0:
         raise ValueError(
@@ -632,23 +282,56 @@ def build_loader(cfg, tokenizer):
 
 
 # =============================================================================
-# Learning Rate Schedule
+# [TRAIN-6] Laplacian Grad Loss (ported from FluidWorld)
 # =============================================================================
 
-def get_lr(step, max_lr, warmup_steps):
+def compute_grad_loss(model, d_model, device):
     """
-    Linear warmup schedule.
+    Compute 1D Laplacian smoothness loss on the final hidden representation.
+    Penalizes high-frequency noise along the sequence dimension, acting as an
+    implicit spatial regularizer. This is the mechanism behind FluidWorld's
+    superior rollout coherence over Transformer and ConvLSTM baselines.
+    """
+    hidden = getattr(model, "_last_hidden", None)
+    if hidden is None:
+        return torch.tensor(0.0, device=device)
+    h_t = hidden.transpose(1, 2)  # (B, D, L)
+    kernel = torch.tensor([1.0, -2.0, 1.0], device=device).view(1, 1, 3)
+    kernel = kernel.expand(d_model, 1, 3)
+    h_padded = F.pad(h_t, (1, 1), mode="constant", value=0.0)
+    lap = F.conv1d(h_padded, kernel, groups=d_model)
+    return lap.abs().mean()
 
-    During the first `warmup_steps` optimizer steps, the LR ramps linearly
-    from 0 to max_lr. After warmup, it stays constant at max_lr.
 
-    We don't use cosine decay here because the training runs indefinitely
-    (no fixed total steps), and the auto-pilot system handles LR reduction
-    on plateaus. For a fixed-length run, cosine decay would be better.
+# =============================================================================
+# [TRAIN-7] Curriculum Scheduler (ported from FluidWorld)
+# =============================================================================
+
+def get_curriculum_value(step, start_val, end_val, curriculum_steps):
+    """
+    Linear ramp from start_val to end_val over curriculum_steps.
+    Returns end_val for all steps beyond curriculum_steps.
+    """
+    if curriculum_steps <= 0 or step >= curriculum_steps:
+        return end_val
+    progress = step / curriculum_steps
+    return start_val + (end_val - start_val) * progress
+
+
+# =============================================================================
+# [TRAIN-1] Cosine Learning Rate Schedule
+# =============================================================================
+
+def get_lr(step, max_lr, warmup_steps, total_steps=50000):
+    """
+    Linear warmup → Cosine annealing to max_lr / 10.
     """
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
-    return max_lr
+    if step >= total_steps:
+        return max_lr * 0.1
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return max_lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
 # =============================================================================
@@ -656,31 +339,13 @@ def get_lr(step, max_lr, warmup_steps):
 # =============================================================================
 
 def build_optimizer(model, cfg):
-    """
-    Build the AdamW optimizer with differential learning rates per parameter group.
-
-    [FIX v4.2.1] Diagnosed problem: long-range diffusion coefficients
-    (dilation=4 and dilation=16) were converging toward ~0 because the
-    next-token loss gradient on seq_len=128 does not reward long-range
-    dependencies. The model was learning to ignore diffusion and effectively
-    becoming a stacked MLP.
-
-    Solution: multiplicative LR per dilation group.
-      - other params   → lr × 1   (original behavior)
-      - diff_coeffs[0] → lr × 10  (dilation=1,  moderate boost)
-      - diff_coeffs[1] → lr × 50  (dilation=4,  strong boost)
-      - diff_coeffs[2] → lr × 100 (dilation=16, very strong boost)
-
-    The effective LR for each group is updated in the training loop
-    via get_lr() × the group multiplier.
-    """
     base_lr = cfg["lr"]
 
-    # Split parameters into 4 groups by role
-    diff_params_d1  = []  # dilation=1
-    diff_params_d4  = []  # dilation=4
-    diff_params_d16 = []  # dilation=16
-    other_params    = []
+    diff_params_d1 = []
+    diff_params_d4 = []
+    diff_params_d16 = []
+    ssm_params = []
+    other_params = []
 
     for name, p in model.named_parameters():
         if "diff_coeffs.0" in name:
@@ -689,27 +354,24 @@ def build_optimizer(model, cfg):
             diff_params_d4.append(p)
         elif "diff_coeffs.2" in name:
             diff_params_d16.append(p)
+        elif "ssm" in name:
+            ssm_params.append(p)
         else:
             other_params.append(p)
 
     param_groups = [
-        {"params": other_params,   "lr": base_lr,         "lr_mult": 1},
-        {"params": diff_params_d1, "lr": base_lr * 10,    "lr_mult": 10},
-        {"params": diff_params_d4, "lr": base_lr * 50,    "lr_mult": 50},
-        {"params": diff_params_d16,"lr": base_lr * 100,   "lr_mult": 100},
+        {"params": other_params,      "lr": base_lr,       "lr_mult": 1},
+        {"params": diff_params_d1,    "lr": base_lr * 10,  "lr_mult": 10},
+        {"params": diff_params_d4,    "lr": base_lr * 50,  "lr_mult": 50},
+        {"params": diff_params_d16,   "lr": base_lr * 100, "lr_mult": 100},
+        {"params": ssm_params,        "lr": base_lr * 2,   "lr_mult": 2},
     ]
 
-    # Filter out empty groups (in case the model is modified)
     param_groups = [g for g in param_groups if len(g["params"]) > 0]
-
-    return torch.optim.AdamW(param_groups)
+    return torch.optim.AdamW(param_groups, weight_decay=0.01)
 
 
 def update_lr(opt, current_lr):
-    """
-    Update the LR for each group while respecting its multiplier.
-    Called at each step instead of the simple `g["lr"] = current_lr`.
-    """
     for g in opt.param_groups:
         g["lr"] = current_lr * g.get("lr_mult", 1)
 
@@ -719,158 +381,240 @@ def update_lr(opt, current_lr):
 # =============================================================================
 
 def train():
-    """
-    The main training loop. Runs indefinitely (epoch after epoch) until
-    manually stopped. Key features:
-
-    1. Hot-reloading: every 10 optimizer steps, the config file is re-read.
-       Changes to lr, dt, t_steps, epsilon, temperature, repetition_penalty
-       take effect immediately. Changes to batch_size or seq_len trigger a
-       DataLoader rebuild.
-
-    2. Gradient accumulation: the effective batch size is
-       batch_size × grad_accum_steps. We accumulate gradients over multiple
-       micro-batches before calling optimizer.step(). This lets us simulate
-       large batch training on limited VRAM.
-
-    3. Mixed precision (AMP): FP16 forward pass with FP32 gradient scaling.
-       Reduces VRAM usage by ~40% and speeds up training on Ampere+ GPUs.
-
-    4. Checkpointing: best model saved every 500 steps (if loss improved),
-       full checkpoint (model + optimizer + scaler) every 1000 steps.
-
-    5. Telemetry: every 50 optimizer steps, we log a comprehensive snapshot
-       (loss, VRAM, speed, sample text, Turing waves, weight histogram)
-       to JSON files that the dashboard reads.
-
-    6. Chat mode: when the dashboard sends a chat request, the engine
-       pauses training, generates a response, writes it to the log file,
-       then resumes training. This lets the researcher interactively
-       probe the model's current capabilities without stopping training.
-
-    [FIX v4.2.1] Three changes from V4.2:
-      - build_optimizer() replaces direct AdamW → differential LR per dilation
-      - update_lr() replaces simple loop over param_groups
-      - Diffusion regularization: penalizes coefficients too close to 0
-        (forces long-range dilations to remain active)
-      - Reset diff_coeffs on checkpoint load if saved values are too small
-        (< 0.02 on average)
-    """
     os.makedirs(SAVE_PATH, exist_ok=True)
     cfg = load_config()
     tokenizer = BPETokenizer()
 
-    # ── Model initialization ─────────────────────────────────────────────
-    model = FluidNet(tokenizer.vocab_size, cfg["d_model"]).to(DEVICE)
+    # [FIX-2] Pass init_dt from config so the dt_gate starts at the right value
+    model = FluidNet(
+        tokenizer.vocab_size,
+        cfg["d_model"],
+        init_dt=cfg.get("dt", 0.1),
+    ).to(DEVICE)
 
-    # [FIX v4.2.1] Optimizer with differential LR per dilation
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    ssm_param_count = sum(
+        p.numel() for n, p in model.named_parameters() if "ssm" in n
+    )
+
+    print(f"\n{'='*60}")
+    print(f"  FluidLM V4.5.0")
+    print(f"{'='*60}")
+    print(f"  d_model:        {cfg['d_model']}")
+    print(f"  num_layers:     {len(model.layers)}")
+    print(f"  Reaction:       SwiGLU (8/3 ratio)")
+    print(f"  Normalization:  RMSNorm")
+    print(f"  Positional:     Sinusoidal")
+    print(f"  Long-range:     Selective SSM (Mamba, d_state=16, pure PyTorch)")
+    print(f"  h-state:        (B, D) + Forget Gate + persistent (optional)")
+    print(f"  Residual scale: 1/sqrt({len(model.layers)})")
+    print(f"  Grad clip:      Layer-wise x{len(model.layers)+2}")
+    print(f"  Grad loss:      Laplacian smoothness w={cfg.get('grad_loss_weight', 0.005)}")
+    print(f"  LR schedule:    Cosine {cfg['lr']} -> {cfg['lr']*0.1:.1e}")
+    print(f"  seq_len:        {cfg['seq_len']}")
+    print(f"  grad_accum:     {cfg.get('grad_accum_steps', 1)} (eff. batch {cfg['batch_size'] * cfg.get('grad_accum_steps', 1)})")
+    print(f"  t_steps:        {cfg['t_steps']}")
+    print(f"  eq_weight:      {cfg.get('eq_weight', 0.01)}")
+    print(f"  curriculum:     {cfg.get('curriculum_steps', 0)} steps")
+    print(f"  init_dt:        {cfg.get('dt', 0.1)} (live recalibration active)")
+    print(f"  Total params:      {total_params:,}")
+    print(f"  Trainable params:  {trainable_params:,}")
+    print(f"  SSM params:        {ssm_param_count:,}")
+    print(f"{'='*60}\n")
+
     opt = build_optimizer(model, cfg)
-
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
     global_step = 0
     global_epoch = 0
     best_loss = float("inf")
+    _last_dt = float(cfg.get("dt", 0.1))  # [FIX-7] last seen dt for live recalibration
 
-    # Rolling statistics buffer — keeps last 1000 data points for dashboard plots
     stats = {
         "step": [], "loss": [], "vram": [], "it_s": [],
         "lr": [], "temp": [], "penalty": [], "avg_steps": [],
+        "main_loss": [], "eq_loss": [], "diff_loss": [], "total_loss": [],
+        "diff_turb": [], "diff_reg": [], "gate_reg": [], "grad_loss": [],
+        "tokens_seen": [],
     }
 
-    # ── Resume from checkpoint if available ──────────────────────────────
+    # -- Resume from checkpoint -------------------------------------------
     if os.path.exists(MODEL_FILE):
-        print("📂 Resuming from checkpoint...")
+        print("Found existing checkpoint...")
         ckpt = torch.load(MODEL_FILE, map_location=DEVICE)
-        model.load_state_dict(
-            ckpt["model_state"] if isinstance(ckpt, dict) else ckpt,
-            strict=False,
-        )
-        if isinstance(ckpt, dict):
-            if "optimizer_state" in ckpt:
-                # [FIX v4.2.1] The number of param_groups changed (1 → 4)
-                # after introducing differential LR per dilation.
-                # We attempt loading but silently ignore it if groups are
-                # incompatible — the model weights are loaded correctly,
-                # only the Adam moment state is lost (acceptable for resuming).
-                try:
-                    opt.load_state_dict(ckpt["optimizer_state"])
-                except ValueError as e:
-                    print(f"⚠️  Optimizer state ignored (incompatible): {e}")
-                    print("   → Resuming with reset optimizer (weights OK).")
-            if "scaler_state" in ckpt:
-                scaler.load_state_dict(ckpt["scaler_state"])
-            global_step = ckpt.get("step", 0)
-            best_loss = ckpt.get("best_loss", float("inf"))
+        old_state = ckpt["model_state"] if isinstance(ckpt, dict) else ckpt
 
-        # [FIX v4.2.1] Reset diffusion coefficients if saved values are too
-        # small (diagnosed: dilation=16 was converging toward ~0.003 after
-        # 10k steps, making long-range diffusion non-existent). Force a clean
-        # restart if necessary.
-        print("🔍 Checking diffusion coefficients...")
-        needs_reinit = False
-        with torch.no_grad():
-            for layer_idx, layer in enumerate(model.layers):
-                for dil_idx, coeff in enumerate(layer.diff_coeffs):
-                    mean_val = coeff.abs().mean().item()
-                    dilation = layer.dilations[dil_idx]
-                    if mean_val < 0.02:
-                        needs_reinit = True
-                        print(f"  ⚠️  Layer {layer_idx}, dilation={dilation}: "
-                              f"mean={mean_val:.5f} < 0.02 → reinitialization required")
+        has_rope = any("rope" in k for k in old_state.keys())
+        has_long_conv = any("long_conv" in k for k in old_state.keys())
+        # V4.4.0 used memory_gate (single Sequential), V4.4.1+ uses memory_gate_x + memory_gate_h
+        # V4.4.2: h shape (B,L,D) -> (B,D), but Linear shapes D->D unchanged -> compatible
+        has_old_memory_gate = any(k.endswith("memory_gate.0.weight") for k in old_state.keys())
 
-        if needs_reinit:
-            print("🔧 Forcing diff_coeffs reinitialization...")
-            with torch.no_grad():
-                for layer in model.layers:
-                    layer.diff_coeffs[0].fill_(0.15)  # dilation=1
-                    layer.diff_coeffs[1].fill_(0.10)  # dilation=4
-                    layer.diff_coeffs[2].fill_(0.08)  # dilation=16
-            print("✅ Coefficients reinitialized: [0.15, 0.10, 0.08]")
+        if has_rope and not has_long_conv:
+            print("  V4.3 checkpoint detected -- partial migration:")
+            print("     OK: Embedding, Reaction MLP, Diffusion coefficients loaded")
+            print("     SKIP: RoPE keys skipped (replaced by sinusoidal PE)")
+            print("     SKIP: CausalLongConv initialized fresh (new component)")
+
+            new_state = model.state_dict()
+            loaded_count = 0
+            for key in old_state:
+                if "rope" in key:
+                    continue
+                if key in new_state and old_state[key].shape == new_state[key].shape:
+                    new_state[key] = old_state[key]
+                    loaded_count += 1
+            model.load_state_dict(new_state)
+            print(f"     Loaded {loaded_count} weight tensors from V4.3")
+
+        elif has_old_memory_gate:
+            print("  Warning: V4.4.0 checkpoint detected -- migrating to V4.4.2+:")
+            print("     (Sequential memory_gate -> memory_gate_x / memory_gate_h)")
+            print("     Compatible weights loaded")
+            print("     memory_gate_x / memory_gate_h: shapes D->D unchanged")
+            print("     h-state (B,L,D) -> (B,D): no weight migration needed")
+            print("     [FIX-6]: global reservoir O(1) restored")
+
+            new_state = model.state_dict()
+            loaded_count = 0
+            for key in old_state:
+                # Map old memory_gate.0.weight/bias → memory_gate_x
+                mapped_key = key
+                if "memory_gate.0.weight" in key:
+                    mapped_key = key.replace("memory_gate.0.weight", "memory_gate_x.weight")
+                elif "memory_gate.0.bias" in key:
+                    mapped_key = key.replace("memory_gate.0.bias", "memory_gate_x.bias")
+                # Skip memory_gate.1 (was Sigmoid, now we have no Sequential)
+                elif "memory_gate.1" in key:
+                    continue
+
+                if mapped_key in new_state and old_state[key].shape == new_state[mapped_key].shape:
+                    new_state[mapped_key] = old_state[key]
+                    loaded_count += 1
+            model.load_state_dict(new_state)
+            print(f"     Loaded {loaded_count} weight tensors from V4.4.0")
+            if isinstance(ckpt, dict):
+                global_step = ckpt.get("step", 0)
+                best_loss = ckpt.get("best_loss", float("inf"))
+            print(f"     Resuming from step {global_step}")
+
         else:
-            print("✅ Diffusion coefficients OK — no reinitialization needed.")
+            try:
+                # V4.5.0 migration: load shape-matched weights, skip mismatches
+                new_state = model.state_dict()
+                loaded_count = 0
+                skipped = []
+                for key in old_state:
+                    if key in new_state and old_state[key].shape == new_state[key].shape:
+                        new_state[key] = old_state[key]
+                        loaded_count += 1
+                    elif key in new_state:
+                        skipped.append(f"{key} ({list(old_state[key].shape)} -> {list(new_state[key].shape)})")
+                    else:
+                        skipped.append(f"{key} (removed)")
+                model.load_state_dict(new_state)
+                if skipped:
+                    print(f"  V4.5.0 migration: {loaded_count} tensors loaded, {len(skipped)} skipped:")
+                    for s in skipped[:10]:
+                        print(f"    - {s}")
+                    if len(skipped) > 10:
+                        print(f"    ... and {len(skipped)-10} more")
+                    print("  New components (SwiGLU, MultiHeadLongConv, RMSNorm) initialized fresh.")
+                    # Reset optimizer since architecture changed
+                    opt = build_optimizer(model, cfg)
+                else:
+                    # Full V4.5.0 checkpoint
+                    if isinstance(ckpt, dict):
+                        if "optimizer_state" in ckpt:
+                            try:
+                                opt.load_state_dict(ckpt["optimizer_state"])
+                            except ValueError:
+                                print("  Optimizer state incompatible, resetting.")
+                        if "scaler_state" in ckpt:
+                            scaler.load_state_dict(ckpt["scaler_state"])
+                if isinstance(ckpt, dict):
+                    global_step = ckpt.get("step", 0)
+                    best_loss = ckpt.get("best_loss", float("inf"))
+                print(f"  Checkpoint loaded (step {global_step})\n")
+            except Exception as e:
+                print(f"  WARNING: Could not load checkpoint: {e}")
+                print("  Starting fresh.\n")
+
+    # -- Verify diffusion coefficients ------------------------------------
+    print("Checking diffusion coefficients...")
+    needs_reinit = False
+    with torch.no_grad():
+        for layer in model.layers:
+            for coeff in layer.diff_coeffs:
+                if coeff.abs().mean().item() < 0.02:
+                    needs_reinit = True
+
+    if needs_reinit:
+        print("Forcing diff_coeffs reinitialization...")
+        with torch.no_grad():
+            for layer in model.layers:
+                layer.diff_coeffs[0].fill_(0.15)
+                layer.diff_coeffs[1].fill_(0.10)
+                layer.diff_coeffs[2].fill_(0.08)
+        print("Coefficients reinitialized: [0.15, 0.10, 0.08]")
+    else:
+        print("Diffusion coefficients OK.")
 
     loader, ds = build_loader(cfg, tokenizer)
-    opt.zero_grad(set_to_none=True)  # set_to_none=True saves memory vs .zero_grad()
+    opt.zero_grad(set_to_none=True)
 
-    # ── Infinite training loop ───────────────────────────────────────────
+    total_steps = cfg.get("total_steps", 50000)
+
+    # -- Infinite training loop -------------------------------------------
     while True:
         pbar = tqdm(loader, desc=f"Epoch {global_epoch}")
 
         for i, (x, y) in enumerate(pbar):
             batch_start = time.time()
 
-            # ── Learning rate schedule ───────────────────────────────────
-            # [FIX v4.2.1] update_lr() respects lr_mult of each group
-            current_lr = get_lr(global_step, cfg["lr"], cfg.get("warmup_steps", 500))
+            current_lr = get_lr(
+                global_step, cfg["lr"],
+                cfg.get("warmup_steps", 500),
+                total_steps,
+            )
             update_lr(opt, current_lr)
 
-            # Determine if this is a logging step (every 50 optimizer steps)
             is_log_step = global_step > 0 and global_step % 50 == 0
 
-            # ── Hot-reload configuration ─────────────────────────────────
-            # Every 10 steps, re-read config.json to pick up any changes
-            # made by the dashboard (LR slider, epsilon, temperature, etc.)
+            # -- Hot-reload configuration ---------------------------------
             if global_step > 0 and global_step % 10 == 0:
                 new_cfg = load_config()
-                # If batch_size or seq_len changed, we need to rebuild the
-                # DataLoader (different window sizes, different batching).
                 if (new_cfg["batch_size"] != cfg["batch_size"] or
                         new_cfg["seq_len"] != cfg["seq_len"]):
                     cfg = new_cfg
                     loader, ds = build_loader(cfg, tokenizer)
-                    break  # Restart the epoch with the new DataLoader
+                    break
                 cfg = new_cfg
 
-            # ── Pause / Chat handling ────────────────────────────────────
+                # [FIX-7] If the dt slider changed, recalibrate dt_gate live on all
+                # layers. The model remains free to adapt afterward -- we just give
+                # it a new starting point without blocking the gradient.
+                new_dt = cfg.get("dt")
+                if new_dt is not None and abs(float(new_dt) - _last_dt) > 1e-6:
+                    _last_dt = float(new_dt)
+                    dt_clamped = max(0.002, min(0.199, float(new_dt)))
+                    dt_recal = math.log((dt_clamped - 0.001) / (0.2 - dt_clamped))
+                    with torch.no_grad():
+                        for layer in model.layers:
+                            layer.dt_gate.copy_(
+                                torch.tensor(dt_recal,
+                                             device=layer.dt_gate.device,
+                                             dtype=layer.dt_gate.dtype)
+                            )
+
+            # -- Pause / Chat handling ------------------------------------
             if cfg.get("pause"):
                 if cfg.get("request_chat"):
-                    # Generate a response to the user's chat prompt
                     res = generate_text(
                         model, ds.tokenizer, cfg,
                         cfg["chat_prompt"], max_tokens=100,
                     )
-                    # Append the generated text to the current log packet
                     try:
                         with open(LOG_FILE, "r") as f:
                             log_packet = json.load(f)
@@ -880,82 +624,98 @@ def train():
                             "waves": [], "w_hist": [], "w_bins": [],
                             "avg_steps": 12,
                         }
-                    log_packet["sample"] = res
+                    log_packet["chat_prompt"] = cfg.get("chat_prompt", "")
+                    log_packet["chat_response"] = res
+                    log_packet["chat_step"] = global_step
                     atomic_write(log_packet, LOG_FILE)
-                    # Clear the chat request and unpause
                     cfg["request_chat"] = False
                     cfg["pause"] = False
                     atomic_write(cfg, CONFIG_FILE)
                 time.sleep(0.5)
                 continue
 
-            # ── Forward pass ─────────────────────────────────────────────
+            # -- Forward pass ---------------------------------------------
             x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
                 out_model = model(
-                    x, cfg["t_steps"], cfg["dt"],
+                    x, cfg["t_steps"], None,
                     return_history=is_log_step,
                     epsilon=cfg.get("epsilon", 1e-4),
                 )
 
                 if is_log_step:
-                    logits_raw, waves, avg_steps = out_model
+                    logits_raw, waves, avg_steps, diff_turb, gate_stats = out_model
                 else:
-                    logits_raw, avg_steps = out_model
-                    waves = []
+                    logits_raw, avg_steps, diff_turb, gate_stats = out_model
 
-                # Standard cross-entropy loss for causal LM
-                loss = nn.CrossEntropyLoss()(
+                main_loss = nn.CrossEntropyLoss()(
                     logits_raw.view(-1, tokenizer.vocab_size), y.view(-1)
                 )
 
-                # [FIX v4.2.2] Corrected diffusion regularization ─────────
-                # Bug in v4.2.1: relu(0.05 - coeff.abs()) ignored negative
-                # coefficients (anti-diffusion). A coeff at -0.08 had
-                # abs()=0.08 > 0.05, so it passed without penalty even though
-                # it was actively destroying diffusion.
-                # Fix: relu(0.05 - coeff) penalizes any coeff < 0.05,
-                # including negatives (anti-diffusion heavily penalized).
                 diffusion_reg = torch.tensor(0.0, device=DEVICE)
                 for layer in model.layers:
                     for coeff in layer.diff_coeffs:
-                        diffusion_reg = diffusion_reg + torch.relu(0.05 - coeff).mean()
-                loss = loss + 0.01 * diffusion_reg
+                        diffusion_reg = diffusion_reg + torch.relu(0.05 - F.softplus(coeff)).mean()
 
-                # Scale loss for gradient accumulation
-                grad_accum = cfg.get("grad_accum_steps", 2)
-                loss = loss / grad_accum
+                # [TRAIN-7] Curriculum: ramp eq_weight and grad_loss_weight
+                curriculum_steps = cfg.get("curriculum_steps", 0)
+                eq_weight_target = cfg.get("eq_weight", 0.01)
+                grad_loss_weight_target = cfg.get("grad_loss_weight", 0.005)
+                if curriculum_steps > 0:
+                    eq_weight = get_curriculum_value(global_step, eq_weight_target * 0.1, eq_weight_target, curriculum_steps)
+                    grad_loss_weight = get_curriculum_value(global_step, 0.0, grad_loss_weight_target, curriculum_steps)
+                else:
+                    eq_weight = eq_weight_target
+                    grad_loss_weight = grad_loss_weight_target
 
-            # ── Backward pass ────────────────────────────────────────────
+                gate_reg_weight = cfg.get("gate_reg_weight", 0.08)
+                eq_loss = eq_weight * diff_turb
+                diff_loss = 0.01 * diffusion_reg
+                gate_reg = gate_reg_weight * gate_stats["total_gate_reg"]
+
+                # [TRAIN-6] Laplacian smoothness loss on hidden representations
+                grad_loss_val = compute_grad_loss(model, cfg["d_model"], DEVICE)
+                grad_loss_term = grad_loss_weight * grad_loss_val
+
+                total_loss = main_loss + eq_loss + diff_loss + gate_reg + grad_loss_term
+
+                grad_accum = cfg.get("grad_accum_steps", 1)
+                loss = total_loss / grad_accum
+
+            # -- Backward pass --------------------------------------------
             scaler.scale(loss).backward()
 
-            # ── Optimizer step (every grad_accum micro-batches) ──────────
+            # -- Optimizer step -------------------------------------------
             if (i + 1) % grad_accum == 0 or (i + 1) == len(loader):
                 scaler.unscale_(opt)
-                # Gradient clipping at norm=1.0 prevents exploding gradients,
-                # which are a real risk with forward Euler integration
-                # (the PDE can amplify gradients across many time steps).
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # [TRAIN-4] Layer-wise gradient clipping (Euler integrator stability).
+                # A global clip lets one unstable layer consume the entire budget,
+                # starving the rest -> loss spikes. Each component gets its own
+                # max_norm=1.0 ceiling: embedding, each FluidLayer, head.
+                torch.nn.utils.clip_grad_norm_(model.embedding.parameters(), max_norm=1.0)
+                for _layer in model.layers:
+                    torch.nn.utils.clip_grad_norm_(_layer.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.head.parameters(), max_norm=1.0)
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
                 global_step += 1
 
-            # ── Telemetry logging ────────────────────────────────────────
+            # -- Telemetry logging ----------------------------------------
             if is_log_step:
                 t_delta = time.time() - batch_start
                 it_s = 1.0 / t_delta if t_delta > 0 else 0.1
                 eta_sec = (len(loader) - i) / it_s
-                loss_val = float(loss.item() * grad_accum)  # Unscaled loss
+
+                loss_val = float(total_loss.item())
                 vram_val = (
                     torch.cuda.memory_reserved() / 1e6
                     if torch.cuda.is_available()
                     else 0
                 )
 
-                # ── Best model checkpoint ────────────────────────────────
-                if global_step % 500 == 0 and loss_val < best_loss:
+                if loss_val < best_loss:
                     best_loss = loss_val
                     torch.save(
                         {"model_state": model.state_dict(), "step": global_step,
@@ -963,7 +723,6 @@ def train():
                         MODEL_FILE.replace(".pth", "_best.pth"),
                     )
 
-                # ── Regular checkpoint ───────────────────────────────────
                 if cfg.get("save_now") or global_step % 1000 == 0:
                     torch.save(
                         {"model_state": model.state_dict(),
@@ -976,30 +735,73 @@ def train():
                         cfg["save_now"] = False
                         atomic_write(cfg, CONFIG_FILE)
 
-                # ── Update rolling statistics ────────────────────────────
+                tokens_seen = global_step * cfg["batch_size"] * cfg["seq_len"] * cfg.get("grad_accum_steps", 1)
+
+                with torch.no_grad():
+                    ew = model.embedding.weight
+                    emb_mean = ew.mean().item()
+                    emb_std = ew.std().item()
+                    emb_min = ew.min().item()
+                    emb_max = ew.max().item()
+
+                    # [FIX-2] Log actual learned dt_val for each layer
+                    dt_vals = []
+                    memory_gate_temps = []
+                    alpha_local_vals = []
+                    for layer in model.layers:
+                        dt_v = (0.001 + (0.2 - 0.001) * torch.sigmoid(layer.dt_gate)).item()
+                        dt_vals.append(round(dt_v, 4))
+                        memory_gate_temps.append(round((layer.memory_gate_temp.abs() + 1.0).item(), 4))
+                        alpha_local_vals.append(round(F.softplus(layer.alpha_local_param).item(), 4))
+
+                    # Gate saturation batch-based (from FluidLayer.forward())
+                    gate_sat_val      = round(gate_stats["gate_sat"].item(), 4)
+                    gate_mean_val     = round(gate_stats["gate_mean"].item(), 4)
+                    decay_mean_val    = round(gate_stats["decay_mean"].item(), 4)
+
+                    # Per-layer decay (learned viscosity) for fine-grained debug
+                    decay_vals = []
+                    for layer in model.layers:
+                        dv = torch.sigmoid(layer.decay_param).mean().item()
+                        decay_vals.append(round(dv, 4))
+
+                    # diff_coeffs per-layer per-dilation -- detects long-range
+                    # diffusion collapse (dilation 16 collapse in practice)
+                    diff_coeff_snapshot = []
+                    for layer in model.layers:
+                        layer_coeffs = [
+                            round(F.softplus(c).mean().item(), 5)
+                            for c in layer.diff_coeffs
+                        ]
+                        diff_coeff_snapshot.append(layer_coeffs)
+
+                # -- Update rolling statistics ----------------------------
                 stats["step"].append(global_step)
                 stats["loss"].append(loss_val)
                 stats["vram"].append(vram_val)
                 stats["it_s"].append(it_s)
-                stats["lr"].append(current_lr)
+                stats["lr"].append(current_lr)  # actual cosine-decayed LR
                 stats["temp"].append(cfg["temperature"])
                 stats["penalty"].append(cfg["repetition_penalty"])
                 stats["avg_steps"].append(float(avg_steps))
-                # Keep only last 1000 points to bound file size
+                stats["main_loss"].append(float(main_loss.item()))
+                stats["eq_loss"].append(float(eq_loss.item()))
+                stats["diff_loss"].append(float(diff_loss.item()))
+                stats["total_loss"].append(float(total_loss.item()))
+                stats["diff_turb"].append(float(diff_turb.item()))
+                stats["diff_reg"].append(float(diffusion_reg.item()))
+                stats["gate_reg"].append(float(gate_reg.item()))
+                stats["grad_loss"].append(float(grad_loss_val.item()))
+                stats["tokens_seen"].append(int(tokens_seen))
+
                 for k in stats.keys():
                     stats[k] = stats[k][-1000:]
 
-                # ── Generate sample text for monitoring ──────────────────
                 sample = generate_text(model, ds.tokenizer, cfg, max_tokens=30)
 
-                # ── Embedding weight histogram ───────────────────────────
-                # Tracking the distribution of embedding weights over time
-                # reveals training health: a collapsing or exploding distribution
-                # is a strong signal of instability.
                 w_vals = model.embedding.weight.detach().flatten().cpu().float().numpy()
-                counts, bins = np.histogram(w_vals, bins=30, range=(-0.2, 0.2))
+                counts, bins = np.histogram(w_vals, bins=30, range=(-0.3, 0.3))
 
-                # ── Write telemetry packet ───────────────────────────────
                 log_packet = {
                     "epoch": global_epoch,
                     "step": global_step,
@@ -1008,19 +810,71 @@ def train():
                     "eta": eta_sec,
                     "vram": vram_val,
                     "sample": sample,
-                    "waves": [w[0].tolist() for w in waves],
+                    "waves": [w[0].tolist() for w in waves] if is_log_step else [],
                     "w_hist": counts.tolist(),
                     "w_bins": bins.tolist(),
                     "timestamp": time.time(),
                     "avg_steps": float(avg_steps),
+
+                    # [FIX-3] Now includes current learning rate
+                    "current_lr": current_lr,
+
+                    # Loss decomposition + health
+                    "main_loss": float(main_loss.item()),
+                    "eq_loss": float(eq_loss.item()),
+                    "diff_loss": float(diff_loss.item()),
+                    "total_loss": float(total_loss.item()),
+                    "diff_turb": float(diff_turb.item()),
+                    "diff_reg": float(diffusion_reg.item()),
+                    "gate_reg": float(gate_reg.item()),
+                    "grad_loss": float(grad_loss_val.item()),
+                    "grad_loss_weight": grad_loss_weight,
+                    "tokens_seen": int(tokens_seen),
+
+                    "dt_learned": dt_vals,
+                    "memory_gate_temps": memory_gate_temps,
+                    "alpha_local_vals": alpha_local_vals,
+
+                    "gate_mean":       gate_mean_val,
+                    "gate_sat":        gate_sat_val,
+                    "decay_mean":      decay_mean_val,
+                    "decay_vals":      decay_vals,
+                    "gate_reg_components": {
+                        "gate": float(gate_stats["gate_reg_loss"].item()),
+                        "decay": float(gate_stats["decay_reg_loss"].item()),
+                    },
+
+                    "emb_mean": float(emb_mean),
+                    "emb_std": float(emb_std),
+                    "emb_min": float(emb_min),
+                    "emb_max": float(emb_max),
+
+                    # diff_coeffs [layer][dilation] -- softplus'd actual values
+                    # Monitors dilation-16 diffusion collapse
+                    "diff_coeff_snapshot": diff_coeff_snapshot,
                 }
                 atomic_write(log_packet, LOG_FILE)
                 atomic_write(stats, STATS_FILE)
+                append_jsonl(
+                    {
+                        "timestamp": log_packet["timestamp"],
+                        "epoch": global_epoch,
+                        "step": global_step,
+                        "loss": loss_val,
+                        "main_loss": float(main_loss.item()),
+                        "eq_loss": float(eq_loss.item()),
+                        "diff_turb": float(diff_turb.item()),
+                        "avg_steps": float(avg_steps),
+                        "current_lr": current_lr,
+                        "gate_sat": gate_sat_val,
+                        "decay_mean": decay_mean_val,
+                        "grad_loss": float(grad_loss_val.item()),
+                        "sample": sample,
+                    },
+                    SAMPLE_HISTORY_FILE,
+                )
 
         else:
-            # The for-else construct: this block runs when the for loop
-            # completes naturally (not via break). It means we finished
-            # an entire epoch without a DataLoader rebuild.
             global_epoch += 1
 
 

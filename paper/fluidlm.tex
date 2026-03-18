@@ -1,0 +1,263 @@
+% FluidLM: Reaction-Diffusion PDEs with Selective State Spaces for Language Modeling
+% arXiv preprint
+%
+% Compile: pdflatex fluidlm.tex && bibtex fluidlm && pdflatex fluidlm.tex && pdflatex fluidlm.tex
+
+\documentclass{article}
+
+\usepackage[preprint]{neurips_2025}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% Custom commands
+\newcommand{\ie}{\textit{i.e.}}
+\newcommand{\eg}{\textit{e.g.}}
+\newcommand{\etal}{\textit{et al.}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\fluidlm}{\textsc{FluidLM}}
+\DeclareMathOperator{\sigmoid}{sigmoid}
+\DeclareMathOperator{\softplus}{softplus}
+\DeclareMathOperator{\silu}{SiLU}
+\DeclareMathOperator{\rmsnorm}{RMSNorm}
+
+\title{\fluidlm{}: Reaction-Diffusion PDEs with Selective State Spaces\\for Language Modeling}
+
+\author{
+  Fabien Polly \\
+  Independent Researcher \\
+}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+% ============================================================================
+I introduce \fluidlm{}, a language model that replaces self-attention with a dual dynamical system: reaction-diffusion partial differential equations (PDEs) for local spatial mixing and a selective state space model (SSM) for content-based temporal routing. Where Transformers compute an $O(N^2)$ attention matrix to propagate information, \fluidlm{} uses Laplacian diffusion at multiple scales to spread information between neighboring tokens, and a Mamba-style selective scan to selectively retain or discard information based on content. Combined with SwiGLU nonlinearities, a global memory pump with learned viscosity, and adaptive computation via Turing equilibrium, the architecture achieves $O(N)$ complexity with no KV-cache. At 44M parameters trained on TinyStories, \fluidlm{} converges to a loss of 5.85, demonstrating that the mathematical framework is sound and the core mechanisms function. While not yet competitive with equivalent Transformers in absolute perplexity, this work establishes reaction-diffusion dynamics as a viable computational substrate for language modeling and identifies the architectural components necessary to make PDE-based sequence processing practical. All development was conducted on a single consumer GPU (RTX 4070~Ti).
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+% ============================================================================
+
+The Transformer architecture~\cite{vaswani2017attention} has dominated language modeling since 2017. Its core mechanism, self-attention, computes pairwise interactions between all tokens in a sequence, producing an $N \times N$ matrix that captures long-range dependencies. This approach has proven remarkably effective, powering models from GPT-4 to Claude to Gemini.
+
+However, self-attention carries structural costs that grow with scale:
+\begin{itemize}
+    \item \textbf{Quadratic complexity.} The $O(N^2)$ attention matrix makes long-context processing expensive. Doubling context quadruples cost.
+    \item \textbf{KV-cache memory wall.} During autoregressive inference, Key and Value matrices for all past tokens must be stored, consuming tens of gigabytes for long sequences.
+    \item \textbf{Static computation.} Every input receives identical computational budget regardless of complexity.
+\end{itemize}
+
+Recent work has explored alternatives: state space models (Mamba~\cite{gu2023mamba}), linear attention (Gated DeltaNet~\cite{yang2024gated}), and recurrent architectures (RWKV~\cite{peng2023rwkv}). These achieve $O(N)$ complexity but retain the standard neural network paradigm of stacked layers with learned weight matrices.
+
+A more radical departure asks: \emph{can continuous dynamical systems replace discrete layer-by-layer computation entirely?} Neural ODEs~\cite{chen2018neural} showed that residual networks can be viewed as discretized ordinary differential equations, suggesting that continuous dynamics are a natural computational substrate.
+
+\fluidlm{} takes this idea further by using \emph{partial} differential equations---specifically, reaction-diffusion systems of the type first studied by Turing~\cite{turing1952chemical} in the context of biological pattern formation. Instead of tokens ``attending'' to each other through an explicit matrix, information propagates through diffusion (local spreading) and reaction (nonlinear transformation), with a selective SSM providing content-based routing for long-range dependencies.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item A language model architecture where the core computation is a reaction-diffusion PDE integrated via forward Euler, combined with a selective state space model for content-based routing.
+    \item A global memory pump with learned viscosity (forget gate) that provides $O(1)$ sequence-level memory without KV-cache.
+    \item Adaptive computation via Turing equilibrium: the PDE halts integration when its state stabilizes, varying compute per input.
+    \item A Laplacian smoothness regularizer that penalizes high-frequency noise in the latent representation, improving autoregressive stability.
+    \item Empirical demonstration that the framework trains and converges on language modeling, with analysis of its current limitations.
+\end{enumerate}
+
+% ============================================================================
+\section{Architecture}
+\label{sec:architecture}
+% ============================================================================
+
+\subsection{Overview}
+
+\fluidlm{} processes a sequence of tokens through the following pipeline:
+
+\begin{enumerate}
+    \item \textbf{Embedding.} Tokens are mapped to $d$-dimensional vectors via a learned embedding matrix $E \in \R^{V \times d}$ (weight-tied with the output head).
+    \item \textbf{Positional encoding.} Sinusoidal positional encodings are added once at the input.
+    \item \textbf{FluidLayers.} $L$ identical-structure layers, each integrating a PDE for $T$ steps.
+    \item \textbf{Output head.} RMSNorm followed by linear projection (tied with $E$) to vocabulary logits.
+\end{enumerate}
+
+\subsection{The FluidLayer}
+
+Each FluidLayer integrates a PDE system for $T$ steps using forward Euler. At each integration step $t$, the state $u \in \R^{B \times N \times d}$ is updated:
+\begin{equation}
+\label{eq:pde}
+u_{t+1} = \rmsnorm\!\left( u_t + \Delta t \cdot \left[ \underbrace{\sum_{k} D_k \nabla^2_{d_k}(u_t)}_{\text{diffusion}} + \underbrace{\text{SSM}(u_t)}_{\text{selective routing}} + \underbrace{R(u_t)}_{\text{reaction}} + \underbrace{\alpha \cdot h_t}_{\text{memory}} \right] \right)
+\end{equation}
+where $\Delta t$ is a learned per-layer scalar.
+
+\paragraph{Multi-scale Laplacian diffusion.}
+The discrete Laplacian kernel $[1, -2, 1]$ is applied as a depthwise 1D convolution at three dilation levels $(d_k \in \{1, 4, 16\})$, each with a learnable diffusion coefficient $D_k \in \R^d$:
+\begin{equation}
+\nabla^2_{d_k}(u)_i = u_{i-d_k} - 2u_i + u_{i+d_k}
+\end{equation}
+This provides multi-scale spatial mixing: dilation 1 handles local syntax, dilation 4 phrase-level structure, and dilation 16 sentence-level context. All operations are causal (left-padded). Total complexity: $O(N \cdot d)$.
+
+\paragraph{Selective State Space Model (Mamba).}
+While the Laplacian provides position-based mixing, it lacks content-based routing---the ability to selectively attend to semantically relevant tokens regardless of position. I address this with a selective SSM~\cite{gu2023mamba} whose discretization matrices depend on the input:
+\begin{align}
+\bar{A}_t &= \exp(\Delta_t \cdot A), \quad \bar{B}_t = \Delta_t \cdot B_t \\
+h_t &= \bar{A}_t \cdot h_{t-1} + \bar{B}_t \cdot x_t \\
+y_t &= C_t \cdot h_t + D \cdot x_t
+\end{align}
+where $\Delta_t$, $B_t$, $C_t$ are computed from the input via learned projections, making the SSM input-dependent. This is mathematically a discretized ODE---the same family as the PDE---and provides content-based routing at $O(N \cdot d \cdot s)$ complexity with constant $O(d \cdot s)$ per-token inference. I use a pure PyTorch implementation without custom CUDA kernels.
+
+\paragraph{Reaction function (SwiGLU).}
+The reaction term is the sole source of nonlinearity:
+\begin{equation}
+R(u) = \left(W_1 u \odot \sigmoid(W_g u)\right) W_2
+\end{equation}
+with $\nicefrac{8}{3}$ expansion ratio, following LLaMA~\cite{touvron2023llama}.
+
+\paragraph{Global memory pump.}
+A global state $h \in \R^{B \times d}$ accumulates a running summary of the sequence:
+\begin{align}
+\text{gate} &= \sigmoid(W_x \bar{u} + W_h h) \\
+\text{decay} &= \sigmoid(\theta_{\text{decay}}) \quad \text{(learned viscosity)} \\
+h &\leftarrow \text{decay} \odot h + \text{gate} \cdot \tanh(\text{mean}_N(R(u)))
+\end{align}
+The decay parameter introduces physical viscosity: the model learns what persists in the reservoir and what dissipates. $h$ is broadcast to all positions, contributing $\alpha \cdot h$ to the PDE. Memory cost: $O(d)$ per layer, independent of sequence length.
+
+\subsection{Adaptive Computation}
+
+At inference time, each FluidLayer monitors the relative change in state between integration steps:
+\begin{equation}
+\tau = \text{mean}\!\left(\frac{|u_{t+1} - u_t|}{|u_t| + \varepsilon}\right)
+\end{equation}
+When $\tau < \varepsilon$ (Turing equilibrium), integration halts early. This provides input-dependent computation: simple inputs converge in fewer steps than complex ones. During training, all $T$ steps execute for full gradient flow, and $\tau$ contributes a differentiable regularization loss $\mathcal{L}_{\text{eq}} = w_{\text{eq}} \cdot \tau$ that encourages representations to converge.
+
+\subsection{Laplacian Smoothness Regularizer}
+
+The 1D Laplacian is applied to the final hidden representation before the output head:
+\begin{equation}
+\mathcal{L}_{\text{grad}} = w_g \cdot \text{mean}\!\left(|\nabla^2_{1D}(z_{\text{final}})|\right)
+\end{equation}
+This penalizes high-frequency oscillations along the sequence dimension, acting as an implicit spatial regularizer. This mechanism was first validated in the FluidWorld vision project~\cite{polly2026fluidworld}, where it directly explains the PDE model's superior rollout coherence over Transformer and ConvLSTM baselines.
+
+% ============================================================================
+\section{Training}
+\label{sec:training}
+% ============================================================================
+
+\subsection{Setup}
+
+\fluidlm{} is trained on TinyStories~\cite{eldan2023tinystories}, a synthetic dataset of short children's stories generated by GPT-3.5/4. I use GPT-2 BPE tokenization (50,257 vocabulary) via tiktoken.
+
+\paragraph{Hyperparameters.}
+$d_{\text{model}} = 512$, $L = 4$ layers, $T = 8$ integration steps per layer, $\Delta t_{\text{init}} = 0.1$, batch size 32, sequence length 256, cosine learning rate schedule with 500-step warmup from $3 \times 10^{-4}$ to $1.3 \times 10^{-5}$. Total parameters: $\sim$44.2M.
+
+\paragraph{Loss function.}
+Standard cross-entropy with auxiliary regularizers:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{CE}} + w_{\text{eq}} \cdot \tau + w_g \cdot \mathcal{L}_{\text{grad}} + w_{\text{gate}} \cdot \mathcal{L}_{\text{gate}}
+\end{equation}
+where $\mathcal{L}_{\text{gate}}$ penalizes gate saturation, and a curriculum scheduler linearly ramps $w_{\text{eq}}$ and $w_g$ from zero to their target values over the first 5,000 steps.
+
+\subsection{Implementation Details}
+
+Mixed precision (FP16 forward, FP32 gradients). Layer-wise gradient clipping applied separately to embedding, each FluidLayer, and head. Weight tying between embedding and output projection. The Streamlit dashboard provides real-time monitoring of loss curves, Turing wave heatmaps, gate saturation, and diffusion coefficient evolution.
+
+% ============================================================================
+\section{Results}
+\label{sec:results}
+% ============================================================================
+
+\subsection{Convergence}
+
+\fluidlm{} V4.5.0 converges from an initial loss of $\sim$10.8 to $\sim$5.85 on TinyStories. The loss curve shows smooth convergence with no training instabilities.
+
+\begin{table}[h]
+\centering
+\caption{Training results on TinyStories.}
+\label{tab:results}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Final loss (CE) & 5.85 \\
+Parameters & 44.2M \\
+Training data & TinyStories \\
+Hardware & 1$\times$ RTX 4070 Ti \\
+Complexity per layer & $O(N \cdot d \cdot s)$ \\
+KV-cache & None \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What Has Been Demonstrated}
+
+\begin{enumerate}
+    \item \textbf{The architecture trains and converges.} The PDE + SSM combination produces a functional language model.
+    \item \textbf{Linear memory scaling.} VRAM scales linearly with sequence length---no quadratic blowup.
+    \item \textbf{Adaptive computation.} The Turing equilibrium criterion fires correctly at inference, varying computation per input.
+    \item \textbf{$O(1)$ memory pump.} The global state $h \in \R^{B \times d}$ provides sequence-level memory without KV-cache.
+\end{enumerate}
+
+\subsection{Honest Assessment}
+
+The current loss of 5.85 on TinyStories is not competitive with a Transformer of equivalent size ($\sim$4.5--5.0 expected). The gap is attributable to:
+\begin{itemize}
+    \item \textbf{First-order integration.} Forward Euler is conditionally stable and first-order accurate. Higher-order integrators (RK4) would allow fewer, more precise steps.
+    \item \textbf{Limited long-range modeling.} While the SSM provides content-based routing, its effective memory span has not been formally characterized.
+    \item \textbf{No scaling validation.} The architecture has only been tested at 44M parameters on a single dataset.
+\end{itemize}
+
+This work does not claim parity with Transformers. It demonstrates that reaction-diffusion PDEs are a \emph{viable} computational substrate for language modeling and identifies the components needed to make them practical.
+
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+% ============================================================================
+
+\paragraph{Neural ODEs and PDEs.}
+Neural ODEs~\cite{chen2018neural} showed that residual networks can be interpreted as discretized ODEs. GRAND~\cite{chamberlain2021grand} applied graph neural diffusion to GNNs. RD-Net~\cite{wang2023rdnet} explored reaction-diffusion dynamics for image classification. \fluidlm{} extends this line to sequence modeling with autoregressive language generation.
+
+\paragraph{State space models.}
+S4~\cite{gu2022efficiently} introduced structured state spaces for long-range sequence modeling. Mamba~\cite{gu2023mamba} added input-dependent selectivity, achieving Transformer-level quality at linear complexity. \fluidlm{} uses a selective SSM as one component of a larger PDE-based system, rather than as the sole sequence mixing mechanism.
+
+\paragraph{Efficient attention alternatives.}
+Linear attention~\cite{katharopoulos2020transformers}, Gated DeltaNet~\cite{yang2024gated}, RWKV~\cite{peng2023rwkv}, and xLSTM~\cite{beck2024xlstm} all achieve sub-quadratic complexity. \fluidlm{} differs in using continuous PDE dynamics as the primary computational substrate, with the SSM providing complementary content-based routing.
+
+\paragraph{Adaptive computation.}
+Adaptive Computation Time~\cite{graves2016adaptive} proposed halting based on learned confidence. Universal Transformers~\cite{dehghani2019universal} applied this to Transformers. \fluidlm{}'s Turing equilibrium provides a physics-inspired alternative: computation halts when the dynamical system reaches a fixed point.
+
+\paragraph{FluidWorld.}
+\fluidlm{} shares its PDE foundation with FluidWorld~\cite{polly2026fluidworld}, a reaction-diffusion world model for video prediction. The Laplacian smoothness regularizer and curriculum training schedule were developed in FluidWorld and ported to \fluidlm{}.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================================
+
+I presented \fluidlm{}, a language model that replaces self-attention with a dual dynamical system: reaction-diffusion PDEs for spatial mixing and selective state spaces for content-based routing. At 44M parameters, the model trains and converges on TinyStories, demonstrating that this mathematical framework is sound.
+
+The current gap with Transformers is real and expected for a first-generation architecture. The path forward includes higher-order integration (RK4), formal scaling studies, persistent inter-segment memory, and extended-context validation. The key insight is that continuous PDEs and discrete SSMs are not competing paradigms but complementary: diffusion provides spatial coherence and the SSM provides content selectivity, operating at $O(N)$ complexity with no KV-cache.
+
+\paragraph{Reproducibility.} All code and training infrastructure are available at \url{https://github.com/infinition/FluidLM}. Experiments were conducted on a single consumer PC (Intel Core i5, NVIDIA RTX 4070~Ti).
+
+% ============================================================================
+% References
+% ============================================================================
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

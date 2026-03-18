@@ -33,6 +33,17 @@ import os
 import json
 
 
+STREAMLIT_LOG = os.path.join("training", "streamlit.log")
+
+
+def check_runtime() -> tuple[bool, str | None]:
+    try:
+        import torch  # noqa: F401
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 def atomic_write(data, path, retries=3):
     """
     Write JSON data to disk atomically using a temporary file + os.replace().
@@ -67,22 +78,26 @@ def launch_laboratory():
     child processes. Monitors their health in a polling loop and performs
     clean shutdown on KeyboardInterrupt (Ctrl+C) or if either process dies.
     """
-    print("🌊 FluidLM Lab - Initializing research environment...")
+    print("FluidLM Lab V4.5.0 - Initializing research environment...")
+    print(f"Python: {sys.executable}")
 
-    # ── Bootstrap default configuration ──────────────────────────────────
-    # These defaults are chosen for a consumer GPU (RTX 3060/4070 class):
-    #   - batch_size=32, seq_len=128: fits comfortably in 8-12GB VRAM
-    #   - d_model=512: 36M param model - small enough to iterate fast
-    #   - t_steps=12, dt=0.1: 12 Euler steps × 0.1 = integration time of 1.2
-    #   - epsilon=1e-4: convergence threshold for Turing equilibrium
-    #   - warmup_steps=500: linear LR warmup to stabilize early training
+    runtime_ok, runtime_error = check_runtime()
+    if not runtime_ok:
+        print("ERROR: Current Python environment cannot launch FluidLM.")
+        print(f"   Reason: {runtime_error}")
+        print("   Run the lab from the conda env that contains torch.")
+        return
+
+    # -- Bootstrap default configuration ----------------------------------
+    # V4.5.0: SwiGLU + Multi-Head LongConv + RMSNorm
+    # Hardware target: consumer GPU (RTX 3060/4070 class, 8-12GB VRAM)
     if not os.path.exists("config.json"):
         default_config = {
-            "lr": 1e-4,
+            "lr": 3e-4,
             "batch_size": 32,
-            "seq_len": 128,
+            "seq_len": 256,
             "d_model": 512,
-            "t_steps": 12,
+            "t_steps": 8,
             "dt": 0.1,
             "repetition_penalty": 1.5,
             "temperature": 0.8,
@@ -94,29 +109,42 @@ def launch_laboratory():
             "auto_pilot": False,
             "last_decay_step": 0,
             "epsilon": 0.05,
+            "eq_weight": 0.01,
+            "gate_reg_weight": 0.08,
+            "warmup_steps": 500,
+            "total_steps": 50000,
+            "grad_accum_steps": 4,
+            "grad_loss_weight": 0.005,
+            "curriculum_steps": 5000,
         }
         atomic_write(default_config, "config.json")
-        print("   ✅ Default config.json created.")
+        print("   Default config.json created (V4.5.0 defaults).")
 
     train_proc, ui_proc = None, None
+    ui_log_handle = None
 
     try:
-        # ── Launch the training engine ───────────────────────────────────
-        print("🚀 Starting training engine (train_engine.py)...")
+        # -- Launch the training engine -----------------------------------
+        print("Starting training engine (train_engine.py)...")
         train_proc = subprocess.Popen([sys.executable, "train_engine.py"])
 
         # Brief delay to let the engine acquire the GPU and start writing
         # telemetry before the dashboard tries to read it.
         time.sleep(2)
 
-        # ── Launch the Streamlit dashboard ───────────────────────────────
-        print("🌊 Starting research dashboard (web_app.py)...")
+        # -- Launch the Streamlit dashboard -------------------------------
+        print("Starting research dashboard (web_app.py)...")
+        os.makedirs(SAVE_PATH := "training", exist_ok=True)
+        ui_log_handle = open(STREAMLIT_LOG, "a", encoding="utf-8")
         ui_proc = subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", "web_app.py"]
+            [sys.executable, "-m", "streamlit", "run", "web_app.py"],
+            stdout=ui_log_handle,
+            stderr=subprocess.STDOUT,
         )
-        print("\n✅ Lab is live → http://localhost:8501")
+        print(f"\nLab is live -> http://localhost:8501")
+        print(f"Streamlit logs -> {STREAMLIT_LOG}")
 
-        # ── Health monitoring loop ───────────────────────────────────────
+        # -- Health monitoring loop ---------------------------------------
         # We poll every second to check if either child has crashed.
         # In production, you might replace this with signal handlers or
         # a proper process supervisor (systemd, supervisord, etc.).
@@ -124,22 +152,24 @@ def launch_laboratory():
             time.sleep(1)
             if (train_proc and train_proc.poll() is not None) or \
                (ui_proc and ui_proc.poll() is not None):
-                print("⚠️ A child process exited unexpectedly.")
+                print("A child process exited unexpectedly.")
                 break
 
     except KeyboardInterrupt:
-        print("\n🛑 Graceful shutdown requested (Ctrl+C)...")
+        print("\nGraceful shutdown requested (Ctrl+C)...")
 
     finally:
-        # ── Cleanup ──────────────────────────────────────────────────────
+        # -- Cleanup ------------------------------------------------------
         # SIGTERM gives each process a chance to flush buffers and save
         # checkpoints before the OS reclaims resources.
-        print("🧹 Terminating child processes...")
+        print("Terminating child processes...")
         if train_proc and train_proc.poll() is None:
             train_proc.terminate()
         if ui_proc and ui_proc.poll() is None:
             ui_proc.terminate()
-        print("💤 Lab shut down cleanly.")
+        if ui_log_handle is not None:
+            ui_log_handle.close()
+        print("Lab shut down cleanly.")
 
 
 if __name__ == "__main__":

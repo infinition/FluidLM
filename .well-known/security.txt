@@ -1,4 +1,0 @@
-Contact: https://github.com/infinition/FluidLM/issues
-Expires: 2027-02-26T12:42:03.000Z
-Preferred-Languages: en, fr
-Policy: https://github.com/infinition/FluidLM/blob/wiki/SECURITY.md

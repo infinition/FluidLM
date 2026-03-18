@@ -1,29 +1,33 @@
-# Modèles entraînés et checkpoints
+# Trained models and checkpoints
 *.pth
 *.pt
 *.ckpt
 /training/
 
-# Données (Livres, textes, etc.)
+# Data
 /data/
-!requirements.txt
-GUIDE_VALIDATION.md
-eval_adaptive.py
-README copy
-test.py
-# Vocabulaire et stats générées
+
+# Generated files
 vocab.pkl
 live_logs.json
 training_stats.json
 config.json
 
-# Environnements virtuels
+# Archive (old docs, deprecated files)
+_archive/
+
+# Virtual environments
 venv/
 env/
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Fichiers OS
+# OS files
 .DS_Store
 Thumbs.db
+
+# IDE
+.vscode/
+.idea/
