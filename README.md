@@ -85,13 +85,13 @@ Two complementary propagation mechanisms replace global attention:
 
 ### The Standard Transformer (what we replace)
 
-$$\text{Attention}(Q, K, V) = \text{Softmax}\!\left(\frac{Q \cdot K^\top}{\sqrt{d_k}}\right) \cdot V$$
+$$\operatorname{Attention}(Q, K, V) = \operatorname{Softmax}\!\left(\frac{Q \cdot K^\top}{\sqrt{d\_k}}\right) \cdot V$$
 
 The product $Q \cdot K^\top$ produces the $N \times N$ attention matrix -- the source of $O(N^2)$ complexity.
 
 ### The FluidLM Governing Equation
 
-$$\frac{\partial u}{\partial t} = \underbrace{\sum_{k} D_k \cdot \nabla^2_{d_k}(u)}_{\text{local diffusion}} + \underbrace{\text{SelectiveSSM}(u)}_{\text{content-based routing}} + \underbrace{R(u,\, \theta)}_{\text{reaction (SwiGLU)}} + \underbrace{\alpha \cdot h}_{\text{global memory}}$$
+$$\frac{\partial u}{\partial t} = \underbrace{\sum\_{k} D\_k \cdot \nabla^2\_{d\_k}(u)}\_{\text{local diffusion}} + \underbrace{\operatorname{SSM}(u)}\_{\text{content-based routing}} + \underbrace{R(u, \theta)}\_{\text{reaction (SwiGLU)}} + \underbrace{\alpha \cdot h}\_{\text{global memory}}$$
 
 #### Term 1: Multi-Scale Local Diffusion
 
@@ -107,9 +107,9 @@ $O(N)$ per step, sequential memory access -- ideal for CPU SIMD.
 
 #### Term 2: Selective State Space (Mamba)
 
-$$h_t = \bar{A}_t \cdot h_{t-1} + \bar{B}_t \cdot x_t$$
+$$h\_t = \bar{A}\_t \cdot h\_{t-1} + \bar{B}\_t \cdot x\_t$$
 
-$$y_t = C_t \cdot h_t + D \cdot x_t$$
+$$y\_t = C\_t \cdot h\_t + D \cdot x\_t$$
 
 Where $A$, $B$, $C$ are **input-dependent** (computed from the current token). This is mathematically a discretized ODE -- the same family as the PDE diffusion. The SSM selectively chooses what to remember and what to forget based on content, providing the content-based routing that pure diffusion lacks.
 
@@ -117,45 +117,45 @@ Pure PyTorch implementation (no custom CUDA kernels). $O(N \cdot d \cdot s)$ tra
 
 #### Term 3: Reaction Function (SwiGLU)
 
-$$R(u,\, \theta) = \left(W_1 \cdot u \odot \sigma(W_g \cdot u)\right) \cdot W_2$$
+$$R(u, \theta) = \left(W\_1 \cdot u \odot \sigma(W\_g \cdot u)\right) \cdot W\_2$$
 
 SwiGLU (V4.5.0) replaces the previous GELU MLP. Proven by LLaMA/PaLM to improve language modeling quality. $\frac{8}{3}$ expansion ratio.
 
 #### Term 4: Global Memory Pump + Forget Gate
 
-$$\text{react\_summary} = \text{mean}_{L}(R(u)) \quad \in \mathbb{R}^{B \times D}$$
+$$s = \operatorname{mean}\_{L}(R(u)) \quad \in \mathbb{R}^{B \times D}$$
 
-$$\text{gate} = \sigma(W_x \cdot \bar{u} + W_h \cdot h) \quad \in \mathbb{R}^{B \times D}$$
+$$g = \sigma(W\_x \cdot \bar{u} + W\_h \cdot h) \quad \in \mathbb{R}^{B \times D}$$
 
-$$\text{decay} = \sigma(\text{decay\_param}) \quad \in (0,1)^{D} \quad \text{(learned viscosity)}$$
+$$\delta = \sigma(\theta\_{\text{decay}}) \quad \in (0,1)^{D} \quad \text{(learned viscosity)}$$
 
-$$h \leftarrow \text{decay} \odot h + \text{gate} \cdot \tanh(\text{react\_summary})$$
+$$h \leftarrow \delta \odot h + g \cdot \tanh(s)$$
 
 $h$ is of shape $(B, D)$ -- global reservoir, $O(1)$ memory. Initialized at $\text{decay} \approx 0.97$.
 
 #### Term 5: Laplacian Grad Loss (V4.4.8)
 
-$$\mathcal{L}_{\text{grad}} = w_g \cdot \text{mean}\!\left(|\nabla^2_{1D}(z_{\text{final}})|\right)$$
+$$\mathcal{L}\_{\text{grad}} = w\_g \cdot \operatorname{mean}\!\left(|\nabla^2\_{1D}(z\_{\text{final}})|\right)$$
 
-Applied to the final hidden representation $z_{\text{final}}$ before the LM head. Penalizes second-order discontinuity along the sequence, encouraging smooth latent representations that degrade gracefully during autoregressive generation.
+Applied to the final hidden representation $z\_{\text{final}}$ before the LM head. Penalizes second-order discontinuity along the sequence, encouraging smooth latent representations that degrade gracefully during autoregressive generation.
 
 ### Positional Encoding: Sinusoidal
 
 Applied once at the FluidNet input (not at each integration step):
 
-$$PE_{(pos, 2i)} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \quad PE_{(pos, 2i+1)} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)$$
+$$PE\_{(pos, 2i)} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \quad PE\_{(pos, 2i+1)} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)$$
 
 Sinusoidal encoding gives a clean additive signal that propagates naturally through the PDE.
 
 ### Time Integration (Forward Euler)
 
-$$u_{t+1} = \text{RMSNorm}\!\left( u_t + \Delta t \cdot \left[ \sum_k D_k \nabla^2_{d_k}(u_t) + \text{SSM}(u_t) + R(u_t,\theta) + \alpha \cdot h_t \right] \right)$$
+$$u\_{t+1} = \operatorname{RMSNorm}\!\left( u\_t + \Delta t \cdot \left[ \sum\_k D\_k \nabla^2\_{d\_k}(u\_t) + \operatorname{SSM}(u\_t) + R(u\_t,\theta) + \alpha \cdot h\_t \right] \right)$$
 
 $\Delta t$ is a per-layer learned parameter (`dt_gate`), initialized from the config `dt` value.
 
 ### Turing Equilibrium and Adaptive Computation
 
-$$\text{turbulence} = \text{mean}\left(\frac{|u_{t+1} - u_t|}{|u_t| + \varepsilon}\right) \xrightarrow{< \varepsilon} \text{HALT}$$
+$$\tau = \operatorname{mean}\left(\frac{|u\_{t+1} - u\_t|}{|u\_t| + \varepsilon}\right) \xrightarrow{< \varepsilon} \text{HALT}$$
 
 During inference, the model halts early when the fluid stabilizes. During training, turbulence contributes to a differentiable regularization loss.
 
