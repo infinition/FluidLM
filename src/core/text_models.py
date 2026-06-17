@@ -301,6 +301,41 @@ class FluidLayer(nn.Module):
         else:
             h_state = torch.zeros(batch, d_model, device=x.device, dtype=x.dtype)
 
+        kernel = self.diffusion_kernel.expand(self.d_model, 1, 3)
+        dt_val = 0.001 + (0.2 - 0.001) * torch.sigmoid(self.dt_gate)
+        alpha = F.softplus(self.alpha_param)
+        alpha_local = F.softplus(self.alpha_local_param)
+        diffusion_coeffs = [F.softplus(c) for c in self.diff_coeffs]
+
+        # --- Point transformations: applied once at full residual gain ---
+        # SSM and SwiGLU are not differential operators. Folding them into the
+        # Euler step scaled their contribution by residual_scale*dt (~0.05),
+        # throttling the model's nonlinear capacity and pinning the loss plateau.
+        x = x + self.ssm(x)
+        x = x + self.reaction(x)
+
+        # Causal local memory
+        local_mem = self.local_memory_proj(self._causal_local_memory(x))
+        x = x + alpha_local * self.dropout_layer(local_mem)
+
+        # --- Global memory pump (causal: position t sees only tokens <= t) ---
+        # Previous version summarized the LAST tokens and broadcast them to every
+        # position, leaking the future into the past under teacher forcing.
+        counts = torch.arange(1, seq_len + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
+        prefix_mean = torch.cumsum(torch.tanh(x), dim=1) / counts
+        gate_logits = (
+            self.memory_gate_x(self.memory_gate_input_norm(x))
+            + self.memory_gate_h(self.memory_gate_state_norm(h_state)).unsqueeze(1)
+        )
+        memory_gate_temp = self.memory_gate_temp.abs() + 1.0
+        gate = torch.sigmoid(torch.tanh(gate_logits / memory_gate_temp) * 2.0)
+        decay = torch.sigmoid(self.decay_param)
+        x = x + alpha * gate * prefix_mean
+        # Segment summary exposed for cross-segment persistent memory (output
+        # only -- never broadcast back into the current sequence).
+        h_state_out = (decay * h_state + prefix_mean[:, -1, :]).detach()
+
+        # --- Diffusion integration: the actual PDE (Forward Euler) ---
         hist = []
         stop_history: List[float] = []
         diff_turbulences: List[torch.Tensor] = []
@@ -308,15 +343,9 @@ class FluidLayer(nn.Module):
         equilibrium_step = max_steps
         prev_probe = self._make_stop_probe(x).detach()
 
-        kernel = self.diffusion_kernel.expand(self.d_model, 1, 3)
-        dt_val = 0.001 + (0.2 - 0.001) * torch.sigmoid(self.dt_gate)
-        alpha = F.softplus(self.alpha_param)
-        alpha_local = F.softplus(self.alpha_local_param)
-        diffusion_coeffs = [F.softplus(c) for c in self.diff_coeffs]
-
         for step_idx in range(max_steps):
-            # Diffusion (3-scale Laplacian)
-            out = x.transpose(1, 2)
+            x_n = self.norm(x)  # pre-norm input to the diffusion operator
+            out = x_n.transpose(1, 2)
             total_diffusion = torch.zeros_like(x)
             for idx, dilation in enumerate(self.dilations):
                 pad_len = 2 * dilation
@@ -324,36 +353,12 @@ class FluidLayer(nn.Module):
                 lap = F.conv1d(padded, kernel, dilation=dilation, groups=self.d_model)
                 total_diffusion = total_diffusion + lap.transpose(1, 2) * diffusion_coeffs[idx]
 
-            # Selective SSM (content-based temporal routing)
-            ssm_out = self.ssm(x)
-
-            # SwiGLU reaction
-            react = self.reaction(x)
-
-            # Causal local memory
-            local_mem = self.local_memory_proj(self._causal_local_memory(x))
-            local_mem = self.dropout_layer(local_mem)
-
-            # Global memory pump
-            summary_tokens = min(self.stop_probe_tokens, seq_len)
-            react_summary = react[:, -summary_tokens:, :].mean(dim=1)
-            x_summary = x[:, -summary_tokens:, :].mean(dim=1)
-            gate_logits = (
-                self.memory_gate_x(self.memory_gate_input_norm(x_summary))
-                + self.memory_gate_h(self.memory_gate_state_norm(h_state))
-            )
-            memory_gate_temp = self.memory_gate_temp.abs() + 1.0
-            gate = torch.sigmoid(torch.tanh(gate_logits / memory_gate_temp) * 2.0)
-            decay = torch.sigmoid(self.decay_param)
-            h_state = decay * h_state + gate * torch.tanh(react_summary)
-
-            # PDE integration (forward Euler)
-            du = total_diffusion + ssm_out + react + alpha * h_state.unsqueeze(1) + alpha_local * local_mem
+            du = total_diffusion
             x_candidate = x + self.residual_scale * dt_val * du
-            x = self.norm(x_candidate)
+            x = x_candidate  # accumulate in residual space; normalize once at the end
 
             if return_history:
-                hist.append(x.abs().mean(dim=-1).detach().cpu().float().numpy())
+                hist.append(self.norm(x).abs().mean(dim=-1).detach().cpu().float().numpy())
 
             # Stopping criterion
             current_probe = self._make_stop_probe(x_candidate).detach()
@@ -372,6 +377,8 @@ class FluidLayer(nn.Module):
 
             if self._should_stop(stop_history, step_idx, epsilon):
                 break
+
+        x = self.norm(x)  # final normalization (once)
 
         diff_turb_mean = (
             torch.stack(diff_turbulences).mean()
@@ -404,7 +411,7 @@ class FluidLayer(nn.Module):
             "gate_reg_loss": gate_reg_loss.detach(),
             "decay_reg_loss": decay_reg_loss.detach(),
             "total_gate_reg": total_gate_reg.detach(),
-            "h_state_out": h_state.detach(),
+            "h_state_out": h_state_out,
         }
 
         return (x, hist, info) if return_history else (x, info)
