@@ -1,3 +1,5 @@
+<img width="254" height="255" alt="image-removebg-preview (5)" src="https://github.com/user-attachments/assets/60b4f991-7913-4400-9425-402f9e7b8119" />
+
 # FluidLM
 
 <img width="1950" height="674" alt="fluidlm_banner" src="https://github.com/user-attachments/assets/d17ee5df-5c7d-423c-a276-1ff4528b9614" />
