@@ -1,4 +1,6 @@
-<img width="254" height="255" alt="image-removebg-preview (5)" src="https://github.com/user-attachments/assets/60b4f991-7913-4400-9425-402f9e7b8119" />
+<p align="center">
+  <img src=".github/FluidLM.png" alt="FluidLM icon" width="254" height="255" />
+</p>
 
 # FluidLM
 
